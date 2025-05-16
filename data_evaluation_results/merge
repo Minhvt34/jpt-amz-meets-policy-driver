@@ -1,0 +1,59 @@
+#!/bin/bash
+# Usage: ./merge directory1 directory2 result_directory
+
+if [ -z "$3" ]; then
+    echo "./merge directory1 directory2 result_directory"
+    exit
+fi
+
+THREADS=16
+
+start=`date +%s`
+
+dir1=$1
+dir2=$2
+result=$3
+
+/bin/rm -fr TOURS-$result
+mkdir -p TOURS-$result
+mkdir -p $result
+
+function merge () {
+    name=$1
+    length1=$(./get_Length TOURS-$dir1/$name.tour)
+    length2=$(./get_Length TOURS-$dir2/$name.tour)
+    length2=$(echo $length2*1.01|bc)
+    length2=${length2/.*}
+    if [ $length1 -le $length2 ]; then
+        ln -fs ../$dir1/$name.ctsptw $result/$name.ctsptw
+        ln -fs ../TOURS-$dir1/$name.tour TOURS-$result/$name.tour
+    else
+        ln -fs ../$dir2/$name.ctsptw $result/$name.ctsptw
+        ln -fs ../TOURS-$dir2/$name.tour TOURS-$result/$name.tour
+    fi
+}
+
+for FILE in `ls $dir1/*.ctsptw` ;
+do
+    name=$(echo "$FILE" | cut -f 2 -d '/' | cut -f 1 -d '.')
+    merge $name &
+    until [ $(jobs | grep Running | wc -l) -lt $THREADS ]; do
+        sleep 0.01
+    done
+done
+wait
+
+
+
+if [ -d "ACTUAL_TOURS" ]
+then
+    ./score $result
+else
+    echo "The optional fast internal JPT scoring is disabled  (as under contest conditions), because the directory ACTUAL_TOURS does not exist."
+    echo "It should contain the actual driven routes in TSPLIB format. You can create it with src/scripts/route2tour.py."
+    echo "E.g. being in the  model_apply_outputs directory, call"
+    echo "\"mkdir ACTUAL_TOURS;  ../../src/scripts/route2tour.py --r_file ../model_apply_inputs/new_route_data.json --s_file ../model_score_inputs/new_actual_sequences.json --out_dir ACTUAL_TOURS/\""
+fi
+
+end=`date +%s`
+echo "Runtime:" $((end-start)) "seconds"

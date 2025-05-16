@@ -1,0 +1,1 @@
+RUNS = 10\nTRACE_LEVEL = 1\nMAX_CANDIDATES = 20\nMAX_TRIALS = 100\nINITIAL_PERIOD = 100\nSEED = 1\nTIME_LIMIT = 300\nTOUR_FILE = best_tour.txt \nPROBLEM_FILE = /home/minhvt/jpt-amz/data-evaluation/model_apply_outputs/TSPLIB_1/amz0000.ctsptw

@@ -1,0 +1,61 @@
+NAME : amz2633.73842_64842.tour
+COMMENT : Cost = 73842_64842
+COMMENT : Found by LKH-AMZ [Keld Helsgaun] Sun May 11 15:18:17 2025
+COMMENT : TW viol.: 0 #: 0
+TYPE : TOUR
+DIMENSION : 52
+TOUR_SECTION
+11
+15
+5
+34
+29
+19
+25
+7
+16
+28
+42
+31
+36
+12
+24
+44
+20
+33
+22
+52
+48
+26
+18
+6
+43
+39
+32
+17
+47
+41
+46
+2
+4
+40
+35
+51
+50
+23
+13
+27
+8
+49
+21
+3
+30
+10
+38
+45
+14
+9
+37
+1
+-1
+EOF
