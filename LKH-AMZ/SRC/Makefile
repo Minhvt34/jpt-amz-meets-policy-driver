@@ -38,18 +38,16 @@ _OBJ = Activate.o AddCandidate.o AddTourCandidates.o                   \
        ReadParameters.o ReadProblem.o RecordBestTour.o                 \
        RecordBetterTour.o RemoveFirstActive.o RestoreTour.o            \
        SpecialMove.o StatusReport.o Statistics.o StoreTour.o           \
-       SymmetrizeCandidateSet.o Trajectory.o WriteTour.o LKH.o
+       SymmetrizeCandidateSet.o WriteTour.o LKH.o
 
 OBJ = $(patsubst %,$(ODIR)/%,$(_OBJ))
 
 $(ODIR)/%.o: %.c $(DEPS) | $(ODIR)
 	$(CC) -c -o $@ $< $(CFLAGS)
 
-.PHONY: 
-	all clean
+.PHONY: all clean
 
-all:
-	$(MAKE) LKH $(PYTHON_SO) # Add python module to 'all' target
+all: LKH $(PYTHON_SO)
 
 # Add a target for the static library
 liblkh.a: $(OBJ)
@@ -63,8 +61,8 @@ $(WRAPPER_OBJ): $(WRAPPER_SRC) $(IDIR)/LKH.h | $(ODIR)
 	$(CXX) -c -o $@ $< $(CXXFLAGS)
 
 # Rule to link the Python shared object
-$(PYTHON_SO): $(WRAPPER_OBJ) liblkh.a
-	$(CXX) -shared -o $@ $(WRAPPER_OBJ) -L. -llkh $(shell python3-config --ldflags) $(CFLAGS)
+$(PYTHON_SO): $(WRAPPER_OBJ) $(OBJ)
+	$(CXX) -shared -o $@ $(WRAPPER_OBJ) $(OBJ) $(shell python3-config --ldflags) -lm
 
 $(ODIR):
 	mkdir -p $(ODIR) # Use -p to avoid error if exists
@@ -72,4 +70,3 @@ $(ODIR):
 clean:
 	/bin/rm -f ../LKH *~ ._* $(IDIR)/*~ $(IDIR)/._* $(PYTHON_SO) $(WRAPPER_OBJ)
 	/bin/rm -fr $(ODIR)
-

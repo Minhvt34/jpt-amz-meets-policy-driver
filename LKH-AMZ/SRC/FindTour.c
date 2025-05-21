@@ -17,6 +17,7 @@
 
 long long FindTour()
 {
+
     long long Cost;
     Node *t;
     int i;
@@ -90,6 +91,5 @@ long long FindTour()
     if (Trial > MaxTrials)
         Trial = MaxTrials;
     CurrentPenalty = BetterPenalty;
-    
     return BetterCost;
 }
