@@ -6,7 +6,7 @@ CFLAGS = -O3 -Wall -pedantic -fPIC -I$(IDIR) -g
 # Add CXX for C++ compilation
 CXX = g++
 # Add CXXFLAGS, inheriting from CFLAGS but allowing C++ specific ones if needed
-CXXFLAGS = $(CFLAGS) -std=c++11 $(shell python3 -m pybind11 --includes) $(shell python3-config --includes)
+CXXFLAGS = $(CFLAGS) -std=c++14 $(shell python3 -m pybind11 --includes) $(shell python3-config --includes)
 
 # Python module name (must match PYBIND11_MODULE macro in the wrapper)
 MODULE_NAME = lkh_solver

@@ -3,6 +3,8 @@ import sys
 import time
 import random
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 # Add the SRC directory to find the Python module
 module_path = os.path.join(os.path.dirname(__file__), 'SRC')
@@ -14,299 +16,378 @@ try:
     print(f"lkh_solver module loaded from: {lkh_solver.__file__}")
 except ImportError as e:
     print(f"Error importing lkh_solver: {e}")
-    print("Please ensure the module is built with the reinforcement learning extensions.")
+    print("Please ensure the module is built with the class-based design for multiprocessing.")
     sys.exit(1)
 
 class LKHSolver:
     """
-    A wrapper class for the LKH solver that ensures proper handling of shared variables.
+    A Python wrapper for the LKHSolver C++ class that provides safe multiprocessing support.
+    Each instance maintains its own isolated state, preventing conflicts between processes.
     """
-    def __init__(self, param_file, problem_file, seed=1):
-        self.param_file = param_file
-        self.problem_file = problem_file
+    def __init__(self, param_file=None, problem_file=None, seed=1):
+        # Create a new C++ LKHSolver instance
+        self.solver = lkh_solver.LKHSolver()
         self.seed = seed
         self.initialized = False
-        self.best_cost = float('inf')
+        
+        # Set files if provided
+        if param_file:
+            self.set_parameter_file(param_file)
+        if problem_file:
+            self.set_problem_file(problem_file)
+        
+    def set_parameter_file(self, param_file):
+        """Set the parameter file path."""
+        if not os.path.exists(param_file):
+            raise FileNotFoundError(f"Parameter file '{param_file}' not found")
+        self.solver.set_parameter_file(param_file)
+        
+    def set_problem_file(self, problem_file):
+        """Set the problem file path."""
+        if not os.path.exists(problem_file):
+            raise FileNotFoundError(f"Problem file '{problem_file}' not found")
+        self.solver.set_problem_file(problem_file)
+        
+    def set_tour_file(self, tour_file):
+        """Set the tour output file path."""
+        self.solver.set_tour_file(tour_file)
+        
+    def set_pi_file(self, pi_file):
+        """Set the pi file path."""
+        self.solver.set_pi_file(pi_file)
+        
+    def set_initial_tour_file(self, initial_tour_file):
+        """Set the initial tour file path."""
+        self.solver.set_initial_tour_file(initial_tour_file)
         
     def initialize(self):
-        """
-        Initialize the solver by reading parameters and problem.
-        """
+        """Initialize the solver by reading parameters and problem."""
         try:
-            # Check files exist
-            if not os.path.exists(self.param_file):
-                raise FileNotFoundError(f"Parameter file '{self.param_file}' not found")
-            if not os.path.exists(self.problem_file):
-                raise FileNotFoundError(f"Problem file '{self.problem_file}' not found")
+            print("Reading parameters...")
+            if not self.solver.read_parameters():
+                raise RuntimeError("Failed to read parameters")
             
-            # Set up file parameters (C++ bindings handle the memory management)
-
-            print("\n--- Testing Step-by-Step Initialization ---")
-            # 1. Set parameter file name (Python wrapper)
-            print("Setting parameter file path...")
-            lkh_solver.read_parameter_file(self.param_file)
-            # 2. Call LKH to read parameters
-            print("Calling LKH_ReadParameters()...")
-            lkh_solver.LKH_ReadParameters()
+            print("Reading problem...")
+            if not self.solver.read_problem():
+                raise RuntimeError("Failed to read problem")
             
-            # 3. Set problem file name (Python wrapper)
-            print("\nSetting problem file path...")
-            lkh_solver.read_problem_file(self.problem_file)
-            # 4. Call LKH to read problem data
-            print("Calling LKH_ReadProblem()...")
-            lkh_solver.LKH_ReadProblem()
-
-            # print(f"Reading parameter file: {self.param_file}")
-            # lkh_solver.read_parameter_file(self.param_file)
-            
-            # print(f"Reading problem file: {self.problem_file}")
-            # lkh_solver.read_problem_file(self.problem_file)
-            
-            # Allocate memory structures
             print("Allocating structures...")
-            lkh_solver.AllocateStructures()
+            if not self.solver.allocate_structures():
+                raise RuntimeError("Failed to allocate structures")
             
             self.initialized = True
+            print(f"Solver initialized successfully. Problem dimension: {self.solver.get_dimension()}")
             return True
         except Exception as e:
             print(f"Initialization error: {e}")
             return False
             
-    def solve_and_record_trajectory(self, max_trials=10, time_limit=3600):
+    def solve_with_trajectory(self, max_trials=10, time_limit=3600):
         """
-        Python implementation of the C++ solve_and_record_trajectory function.
-        
-        This function follows the same structure as the C++ equivalent,
-        but calls the appropriate binding functions for each step.
-        
-        Args:
-            max_trials: Maximum number of trials
-            time_limit: Time limit in seconds
-            
-        Returns:
-            best_cost: The cost of the best tour found
+        Solve using the C++ implementation with trajectory recording.
+        This is the recommended method for production use.
         """
         if not self.initialized and not self.initialize():
             raise RuntimeError("Failed to initialize the solver")
         
-        # Initialize LKH global variables for the run (seed, BestCost, etc.)
-        print(f"Initializing LKH run globals with seed: {self.seed}")
-        lkh_solver.initialize_lkh_run_globals(self.seed) # Sets BestCost = LLONG_MAX, etc.
-
-        # Fallback for direct C++ solver (can be un-commented for comparison or if Python path has issues)
-        # print("Note: For a stable run, consider using the direct C++ solve_and_record_trajectory.")
-        # return lkh_solver.solve_and_record_trajectory(self.param_file, self.problem_file)
+        print(f"Starting C++ solver with max_trials={max_trials}, time_limit={time_limit}, seed={self.seed}")
+        
+        # Use the C++ high-level solver interface
+        try:
+            return self.solver.solve_with_trajectory(max_trials, time_limit)
+        except Exception as e:
+            print(f"Error in C++ solve_with_trajectory: {e}")
+            raise
+    
+    def solve_python_controlled(self, max_trials=10, time_limit=3600):
+        """
+        Python-controlled solving using granular C++ method calls.
+        This provides more control but is more complex.
+        """
+        if not self.initialized and not self.initialize():
+            raise RuntimeError("Failed to initialize the solver")
         
         try:
-            print("Creating candidate set using safe wrapper...")
-            if not lkh_solver.CreateCandidateSet(): # Uses safe_create_candidate_set
-                raise RuntimeError("Failed to create candidate set using safe_create_candidate_set")
+            print(f"Initializing solver run with seed: {self.seed}")
+            self.solver.initialize_run_globals(self.seed)
+
+            print("Creating candidate set...")
+            if not self.solver.create_candidate_set():
+                raise RuntimeError("Failed to create candidate set")
             
             print("Initializing statistics...")
-            lkh_solver.InitializeStatistics()
+            self.solver.initialize_statistics()
             
-            # --- Python takes over FindTour's main loop logic --- 
-            print("Python is now controlling the LKH trial loop.")
+            print("Validating solver state...")
+            if not self.solver.validate_solver_state(True):
+                raise RuntimeError("Solver state validation failed")
+            
+            # Reset node tour fields
+            self.solver.reset_node_tour_fields()
 
-            # Reset node tour fields (OldPred, OldSuc, NextBestSuc, BestSuc = 0)
-            lkh_solver.py_reset_node_tour_fields()
+            # Initialize run-specific bests
+            self.solver.set_better_cost(sys.maxsize)
+            self.solver.set_better_penalty(sys.maxsize)
 
-            # Initialize run-specific bests (BetterCost, BetterPenalty)
-            # Using sys.maxsize as a proxy for LLONG_MAX; C++ bindings use actual LLONG_MAX.
-            # initialize_lkh_run_globals already set BestCost, this is for *this run's* best *before* global update.
-            lkh_solver.set_better_cost(sys.maxsize) 
-            lkh_solver.set_better_penalty(sys.maxsize)
-            # CurrentPenalty is usually set by ChooseInitialTour or Penalty() within the loop
-
-            if max_trials > 0: # Corresponds to LKH's if (MaxTrials > 0)
-                if lkh_solver.is_hashing_used():
-                    print("Initializing LKH Hash Table (HTable)...")
-                    lkh_solver.HashInitialize() # HTable is a global pointer in LKH, init once per run
-            else: # Special LKH logic for MaxTrials == 0 (usually for debugging or simple cases)
-                print("MaxTrials is 0. Following LKH's specific path for this scenario.")
-                lkh_solver.set_trial_number(1) # Trial is 1 for this path
-                print("Choosing initial tour for MaxTrials=0 case...")
-                if not lkh_solver.ChooseInitialTour(): # This sets up an initial tour
+            if max_trials > 0:
+                if self.solver.is_hashing_used():
+                    print("Initializing hash table...")
+                    self.solver.hash_initialize()
+            else:
+                print("MaxTrials is 0. Using special path.")
+                self.solver.set_trial_number(1)
+                if not self.solver.choose_initial_tour():
                     raise RuntimeError("ChooseInitialTour failed in MaxTrials=0 case")
                 
-                # In LKH, for MaxTrials=0, CurrentPenalty and BetterPenalty are often set based on this initial tour's penalty.
-                current_p = lkh_solver.py_calculate_penalty()
-                lkh_solver.set_current_penalty(current_p)
-                lkh_solver.set_better_penalty(current_p)
-                # BetterCost would be the cost of this initial tour. LinKernighan is not run.
-                # This path is less common for full optimization. We might need to get the cost associated 
-                # with ChooseInitialTour if it were to be returned directly. The current structure 
-                # will proceed to finalize_run_and_get_cost which expects LinKernighan to have run.
-                # For simplicity, we'll let it run through, but acknowledge this edge case.
-                print(f"MaxTrials=0: Initial tour chosen. Penalty: {current_p}. No LK trials will run.")
+                current_p = self.solver.calculate_penalty()
+                self.solver.set_current_penalty(current_p)
+                self.solver.set_better_penalty(current_p)
 
             print("Preparing initial kicking strategy...")
-            if not lkh_solver.PrepareKicking(): # Initial kick setup before the main loop
+            if not self.solver.prepare_kicking():
                 raise RuntimeError("Failed to prepare initial kicking strategy")
             
             start_time = time.time()
-            print(f"Starting LKH trials loop: 1 to {max_trials}")
-            for trial_num_py in range(1, max_trials + 1):
-                # Time limit check (as in original C++ and previous Python versions)
-                if trial_num_py > 1 and (time.time() - start_time) >= time_limit:
+            print(f"Starting solver trials: 1 to {max_trials}")
+            
+            for trial_num in range(1, max_trials + 1):
+                # Time limit check
+                if trial_num > 1 and (time.time() - start_time) >= time_limit:
                     print("*** Time limit exceeded ***")
                     break
                 
-                lkh_solver.set_trial_number(trial_num_py) # Sync LKH's global Trial variable
-                print(f"-- Trial {lkh_solver.get_trial_number()}/{max_trials} --")
+                self.solver.set_trial_number(trial_num)
+                print(f"-- Trial {trial_num}/{max_trials} --")
 
-                # Choose FirstNode at random (mimicking LKH's FindTour)
-                lkh_solver.py_select_random_first_node()
-                # first_node_id = lkh_solver.get_first_node_id()
-                # print(f"Selected FirstNode ID: {first_node_id}")
+                # Choose FirstNode at random
+                self.solver.select_random_first_node()
 
-                print(f"Choosing initial tour for trial {trial_num_py}...")
-                if not lkh_solver.ChooseInitialTour(): # This modifies Suc, Pred, and potentially CurrentPenalty
-                    print(f"Warning: ChooseInitialTour failed for trial {trial_num_py}. Skipping LKH run for this trial.")
-                    continue # Or handle error more robustly
-                
-                # CurrentPenalty is updated by ChooseInitialTour or LinKernighan internally in LKH.
-                # We fetch it after these calls.
-
-                print(f"Running Lin-Kernighan for trial {trial_num_py}...")
-                cost_after_lk = lkh_solver.LinKernighan() # Modifies Suc, Pred, and CurrentPenalty
-
-                if cost_after_lk == sys.maxsize: # LLONG_MAX from C++ indicates an error in safe_lin_kernighan
-                    print(f"Error in LinKernighan algorithm for trial {trial_num_py}. Skipping trial.")
+                print(f"Choosing initial tour for trial {trial_num}...")
+                if not self.solver.choose_initial_tour():
+                    print(f"Warning: ChooseInitialTour failed for trial {trial_num}")
                     continue
                 
-                # Fetch current penalty *after* LK, as LK might update it (e.g., via StoreTour -> Penalty)
-                current_penalty_val = lkh_solver.get_current_penalty()
+                print(f"Running Lin-Kernighan for trial {trial_num}...")
+                cost_after_lk = self.solver.lin_kernighan()
+
+                if cost_after_lk == sys.maxsize:
+                    print(f"Error in LinKernighan algorithm for trial {trial_num}")
+                    continue
                 
-                # Python now implements the logic to check for improvement and update run bests
-                better_penalty_val = lkh_solver.get_better_penalty()
-                better_cost_val = lkh_solver.get_better_cost()
+                # Get current penalty after LK
+                current_penalty_val = self.solver.calculate_penalty()
+                self.solver.set_current_penalty(current_penalty_val)
+                
+                # Check for improvement
+                better_penalty_val = self.solver.get_better_penalty()
+                better_cost_val = self.solver.get_better_cost()
 
-                print(f"Trial {trial_num_py}: Cost from LK = {cost_after_lk}, CurrentPenalty = {current_penalty_val}")
-                print(f"Comparing with: BetterCost = {better_cost_val}, BetterPenalty = {better_penalty_val}")
+                print(f"Trial {trial_num}: Cost={cost_after_lk}, Penalty={current_penalty_val}")
+                print(f"Comparing with: BetterCost={better_cost_val}, BetterPenalty={better_penalty_val}")
 
-                improved_this_trial = False
+                improved = False
                 if current_penalty_val < better_penalty_val or \
                    (current_penalty_val == better_penalty_val and cost_after_lk < better_cost_val):
-                    improved_this_trial = True
-                    print(f"Trial {trial_num_py}: Improvement found! OldBest: {better_cost_val}_{better_penalty_val}")
+                    improved = True
+                    print(f"Trial {trial_num}: Improvement found!")
                     
-                    lkh_solver.set_better_cost(cost_after_lk)
-                    lkh_solver.set_better_penalty(current_penalty_val)
-                    print(f"New run best: Cost={lkh_solver.get_better_cost()}, Penalty={lkh_solver.get_better_penalty()}")
+                    self.solver.set_better_cost(cost_after_lk)
+                    self.solver.set_better_penalty(current_penalty_val)
                     
-                    print("Recording better tour (updates BestSuc pointers from current Suc, fills BetterTour array)...")
-                    if not lkh_solver.RecordBetterTour(): # Uses current Suc links, affects BestSuc
-                        print(f"Warning: RecordBetterTour failed in trial {trial_num_py}.")
-                        # This is a critical failure if it happens, may lead to incorrect final tour
+                    print("Recording better tour...")
+                    if not self.solver.record_better_tour():
+                        print(f"Warning: RecordBetterTour failed in trial {trial_num}")
 
                     print("Adjusting candidate set...")
-                    if not lkh_solver.AdjustCandidateSet(): # Uses current Suc links
-                         print(f"Warning: AdjustCandidateSet failed in trial {trial_num_py}.")
+                    if not self.solver.adjust_candidate_set():
+                         print(f"Warning: AdjustCandidateSet failed in trial {trial_num}")
 
                     print("Preparing for next kick...")
-                    if not lkh_solver.PrepareKicking(): # Uses current Suc links
-                        print(f"Warning: PrepareKicking failed in trial {trial_num_py}.")
+                    if not self.solver.prepare_kicking():
+                        print(f"Warning: PrepareKicking failed in trial {trial_num}")
 
-                    # Hashing logic: LKH's StoreTour (called by LinKernighan if it finds an improvement 
-                    # *within its own scope*) handles HashInsert. Python doesn't need to call HashInsert directly here.
-                    if lkh_solver.is_hashing_used():
-                        # LKH Hash is updated internally by StoreTour if LK found its own new best. Python doesn't need to re-insert.
-                        # print(f"LKH Hash is now: {lkh_solver.get_lkh_hash()}") 
-                        pass # No explicit HashInsert from Python needed here
+                    if self.solver.is_hashing_used():
+                        self.solver.hash_initialize()
+                        self.solver.hash_insert(self.solver.get_lkh_hash(), cost_after_lk)
 
-                else:
-                    print(f"Trial {trial_num_py}: No improvement over current run best ({better_cost_val}_{better_penalty_val}).")
+                if not improved:
+                    print(f"Trial {trial_num}: No improvement")
             
-            # --- End of Python-controlled trial loop ---
-            print("Python LKH trial loop finished.")
+            print("Finalizing tour structure...")
+            self.solver.finalize_tour_from_best_suc()
 
-            # Finalize the tour structure (Suc from BestSuc) and update LKH global Hash
-            print("Finalizing tour structure (Suc from BestSuc) and LKH Hash...")
-            lkh_solver.py_finalize_tour_from_best_suc()
-
-            # Set LKH's global CurrentPenalty to the best penalty found in THIS run for RecordBestTour.
-            final_run_penalty = lkh_solver.get_better_penalty()
-            lkh_solver.set_current_penalty(final_run_penalty if final_run_penalty != sys.maxsize else 0)
-            # Cost for RecordBestTour will be BetterCost of this run (already set if improvements were made)
-            # or the initial large value if no tour was found/improved.
+            # Set final penalty
+            final_run_penalty = self.solver.get_better_penalty()
+            if final_run_penalty != sys.maxsize:
+                self.solver.set_current_penalty(final_run_penalty)
             
-            # Record the best tour of this run against LKH's overall BestCost/BestPenalty
-            print("Calling RecordBestTour to update LKH's global best if this run was better...")
-            if not lkh_solver.RecordBestTour(): # This updates LKH's *global* BestCost, BestPenalty, BestTour
-                print("Warning: RecordBestTour failed after trials loop.")
+            print("Recording best tour...")
+            if not self.solver.record_best_tour():
+                print("Warning: RecordBestTour failed")
 
-            # The cost of THIS specific Python-controlled run is in lkh_solver.get_better_cost()
-            final_run_cost = lkh_solver.get_better_cost()
-            if final_run_cost == sys.maxsize: # If no tour was ever accepted as "better"
-                print("Warning: No tour was found or improved during this run. Cost remains at max_size.")
-                # Potentially return an error or a very high value to indicate failure.
-                # For now, we return it as is, but this indicates an issue.
-
-            print(f"Best cost for THIS Python-controlled run: {final_run_cost}")
+            final_run_cost = self.solver.get_better_cost()
+            print(f"Best cost for this run: {final_run_cost}")
             
-            # Get and print the overall best tour (from LKH's global BestTour array, updated by RecordBestTour)
+            # Get best tour details
             try:
-                best_tour_nodes = lkh_solver.get_best_tour()
-                print(f"LKH's overall best tour (first 10 nodes): {best_tour_nodes[:min(10, len(best_tour_nodes))]}")
-                print(f"LKH's overall best cost: {lkh_solver.get_best_cost()}") # Compare with final_run_cost
+                best_tour_nodes = self.solver.get_best_tour()
+                print(f"Best tour (first 10 nodes): {best_tour_nodes[:min(10, len(best_tour_nodes))]}")
+                print(f"Overall best cost: {self.solver.get_best_cost()}")
             except Exception as e:
-                print(f"Error getting LKH's best tour details: {e}")
+                print(f"Error getting best tour details: {e}")
             
             return final_run_cost
             
         except Exception as e:
             import traceback
-            print(f"Error in Python solve_and_record_trajectory (granular control): {e}")
+            print(f"Error in Python-controlled solve: {e}")
             traceback.print_exc()
-            print("Consider falling back to direct C++ lkh_solver.solve_and_record_trajectory for robustness if issues persist.")
-            raise # Re-raise the exception to make it clear the Python path failed
+            raise
     
-    def solve(self, max_trials=10, time_limit=3600):
+    def solve(self, max_trials=10, time_limit=3600, use_python_control=False):
         """
         Solve the TSP problem.
-        This is a simple wrapper around solve_and_record_trajectory.
         
         Args:
             max_trials: Maximum number of trials
             time_limit: Time limit in seconds
+            use_python_control: If True, use Python-controlled solving (more verbose)
+                              If False, use C++ high-level interface (recommended)
             
         Returns:
             best_cost: The cost of the best tour found
         """
-        return self.solve_and_record_trajectory(max_trials, time_limit)
+        if use_python_control:
+            return self.solve_python_controlled(max_trials, time_limit)
+        else:
+            return self.solve_with_trajectory(max_trials, time_limit)
     
     def get_tour(self):
-        """
-        Get the best tour found by the solver.
-        
-        Returns:
-            tour: List of node IDs in the best tour
-        """
-        return lkh_solver.get_best_tour()
+        """Get the best tour found by the solver."""
+        return self.solver.get_best_tour()
         
     def get_cost(self):
-        """
-        Get the cost of the best tour.
-        
-        Returns:
-            cost: Cost of the best tour
-        """
-        return lkh_solver.get_best_cost()
+        """Get the cost of the best tour."""
+        return self.solver.get_best_cost()
         
     def get_dimension(self):
-        """
-        Get the dimension of the problem.
+        """Get the dimension of the problem."""
+        return self.solver.get_dimension()
         
-        Returns:
-            dimension: Number of nodes in the problem
-        """
-        return lkh_solver.get_dimension()
+    def validate_state(self, fix_issues=True):
+        """Validate the solver's internal state."""
+        return self.solver.validate_solver_state(fix_issues)
+
+def solve_tsp_instance(args):
+    """
+    Worker function for multiprocessing.
+    Each process gets its own isolated LKHSolver instance.
+    """
+    param_file, problem_file, max_trials, seed, time_limit, instance_id = args
+    
+    try:
+        print(f"Process {instance_id}: Starting with seed {seed}")
         
+        # Create a new solver instance for this process
+        solver = LKHSolver(param_file, problem_file, seed)
+        
+        # Solve the problem
+        best_cost = solver.solve(max_trials, time_limit)
+        
+        # Get the tour
+        best_tour = solver.get_tour()
+        
+        print(f"Process {instance_id}: Completed with cost {best_cost}")
+        
+        return {
+            'instance_id': instance_id,
+            'seed': seed,
+            'best_cost': best_cost,
+            'best_tour': best_tour,
+            'dimension': solver.get_dimension()
+        }
+        
+    except Exception as e:
+        print(f"Process {instance_id}: Error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'instance_id': instance_id,
+            'seed': seed,
+            'error': str(e),
+            'best_cost': float('inf')
+        }
+
+def solve_tsp_multiprocessing(param_file, problem_file, max_trials=10, time_limit=3600, 
+                            num_processes=None, seeds=None):
+    """
+    Solve TSP using multiple processes with different seeds.
+    Each process gets its own isolated solver instance.
+    
+    Args:
+        param_file: Path to the parameter file
+        problem_file: Path to the problem file
+        max_trials: Maximum number of trials per process
+        time_limit: Time limit in seconds per process
+        num_processes: Number of processes to use (default: CPU count)
+        seeds: List of seeds to use (default: range(num_processes))
+    
+    Returns:
+        List of results from all processes
+    """
+    if num_processes is None:
+        num_processes = multiprocessing.cpu_count()
+    
+    if seeds is None:
+        seeds = list(range(1, num_processes + 1))
+    
+    if len(seeds) != num_processes:
+        raise ValueError(f"Number of seeds ({len(seeds)}) must match number of processes ({num_processes})")
+    
+    print(f"Starting multiprocessing with {num_processes} processes")
+    print(f"Seeds: {seeds}")
+    
+    # Prepare arguments for each process
+    process_args = [
+        (param_file, problem_file, max_trials, seed, time_limit, i)
+        for i, seed in enumerate(seeds)
+    ]
+    
+    results = []
+    
+    # Use ProcessPoolExecutor for better resource management
+    with ProcessPoolExecutor(max_workers=num_processes) as executor:
+        # Submit all tasks
+        future_to_args = {
+            executor.submit(solve_tsp_instance, args): args 
+            for args in process_args
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_args):
+            args = future_to_args[future]
+            try:
+                result = future.result()
+                results.append(result)
+                print(f"Process {result['instance_id']} completed: Cost = {result.get('best_cost', 'ERROR')}")
+            except Exception as e:
+                print(f"Process {args[5]} generated an exception: {e}")
+                results.append({
+                    'instance_id': args[5],
+                    'seed': args[3],
+                    'error': str(e),
+                    'best_cost': float('inf')
+                })
+    
+    # Sort results by instance_id for consistent ordering
+    results.sort(key=lambda x: x['instance_id'])
+    
+    return results
+
 def solve_tsp_advanced(param_file, problem_file, max_trials=10, seed=1, time_limit=3600):
     """
     Advanced Python implementation of the TSP solver.
-    Uses a wrapper approach to ensure proper handling of shared variables.
+    Uses the new class-based wrapper for safe operation.
     
     Args:
         param_file: Path to the parameter file
@@ -324,22 +405,53 @@ def solve_tsp_advanced(param_file, problem_file, max_trials=10, seed=1, time_lim
 # Example usage
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} parameter_file problem_file [max_trials] [seed] [time_limit]")
+        print(f"Usage: {sys.argv[0]} parameter_file problem_file [max_trials] [seed] [time_limit] [--multiprocess] [--num_processes]")
+        print("Examples:")
+        print(f"  {sys.argv[0]} params.par problem.tsp")
+        print(f"  {sys.argv[0]} params.par problem.tsp 10 1 3600")
+        print(f"  {sys.argv[0]} params.par problem.tsp 10 1 3600 --multiprocess --num_processes 4")
         sys.exit(1)
     
     param_file = sys.argv[1]
     problem_file = sys.argv[2]
     
-    # param_file = "/home/kaiz/jpt-amz-meets-policy-driver/data-evaluation/model_apply_outputs/TSPLIB_1/amz0000.par"
-    # problem_file = "/home/kaiz/jpt-amz-meets-policy-driver/data-evaluation/model_apply_outputs/TSPLIB_1/amz0000.ctsptw"
-    
     max_trials = int(sys.argv[3]) if len(sys.argv) > 3 else 10
     seed = int(sys.argv[4]) if len(sys.argv) > 4 else 1
     time_limit = int(sys.argv[5]) if len(sys.argv) > 5 else 3600
     
+    use_multiprocessing = '--multiprocess' in sys.argv
+    
     try:
-        best_cost = solve_tsp_advanced(param_file, problem_file, max_trials, seed, time_limit)
-        print(f"Final best tour cost: {best_cost}")
+        if use_multiprocessing:
+            # Get number of processes
+            num_processes = multiprocessing.cpu_count()
+            if '--num_processes' in sys.argv:
+                idx = sys.argv.index('--num_processes')
+                if idx + 1 < len(sys.argv):
+                    num_processes = int(sys.argv[idx + 1])
+            
+            print(f"Running multiprocessing solver with {num_processes} processes")
+            results = solve_tsp_multiprocessing(
+                param_file, problem_file, max_trials, time_limit, num_processes
+            )
+            
+            # Print summary
+            print("\n=== MULTIPROCESSING RESULTS ===")
+            best_result = min(results, key=lambda x: x.get('best_cost', float('inf')))
+            
+            for result in results:
+                status = "ERROR" if 'error' in result else "OK"
+                cost = result.get('best_cost', 'N/A')
+                print(f"Process {result['instance_id']} (seed {result['seed']}): {cost} [{status}]")
+            
+            print(f"\nBest result: Cost = {best_result.get('best_cost', 'N/A')} (Process {best_result['instance_id']}, Seed {best_result['seed']})")
+            
+        else:
+            # Single process
+            print(f"Running single-process solver")
+            best_cost = solve_tsp_advanced(param_file, problem_file, max_trials, seed, time_limit)
+            print(f"Final best tour cost: {best_cost}")
+            
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1) 

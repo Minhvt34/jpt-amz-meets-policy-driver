@@ -8,6 +8,8 @@
 #include <climits> // For LLONG_MAX
 #include <stdexcept> // For std::runtime_error
 #include <cstring>   // For strcpy
+#include <memory>    // For smart pointers
+#include <mutex>     // For thread safety
 
 namespace py = pybind11;
 
@@ -93,832 +95,1205 @@ extern "C" {
     void HashInsert(HashTable *T, unsigned Hash, long long Cost); // Changed second param from long long to unsigned
 }
 
-// Function to initialize LKH global variables for a run
-void initialize_lkh_run_globals(unsigned int seed_val) {
-    BestCost = LLONG_MAX;
-    BestPenalty = LLONG_MAX;
-    CurrentPenalty = LLONG_MAX;
-    Runs = 1; // We are doing one run for trajectory recording
-    Run = 1;
-    SRandom(seed_val); // Use the provided seed
+// Global mutex for thread safety when accessing LKH globals
+static std::mutex lkh_global_mutex;
+
+/**
+ * LKHSolver class - Encapsulates all LKH state in a separate instance
+ * This allows multiple independent solver instances for multiprocessing
+ */
+class LKHSolver {
+private:
+    // File paths - managed by this instance
+    std::string param_file_path;
+    std::string problem_file_path;
+    std::string tour_file_path;
+    std::string pi_file_path;
+    std::string initial_tour_file_path;
     
-    printf("PY_WRAP_DEBUG: LKH run globals initialized. Seed=%u, BestCost=%lld\n", seed_val, BestCost);
+    // C-style strings for LKH functions (allocated/deallocated by this instance)
+    char* param_file_cstr;
+    char* problem_file_cstr;
+    char* tour_file_cstr;
+    char* pi_file_cstr;
+    char* initial_tour_file_cstr;
+    
+    // Instance-specific copies of LKH global variables
+    double instance_StartTime;
+    int instance_MaxMatrixDimension;
+    int instance_CTSPTransform;
+    int instance_GTSPSets;
+    int instance_DimensionSaved;
+    
+    struct Node *instance_NodeSet;
+    long long instance_MM;
+    int instance_Precision;
+    int instance_Norm;
+    
+    long long instance_BestCost;
+    long long instance_BetterCost;
+    long long instance_BestPenalty;
+    long long instance_BetterPenalty;
+    long long instance_CurrentPenalty;
+    double instance_LowerBound;
+    
+    int instance_Runs;
+    int instance_Run;
+    int instance_Trial;
+    int instance_MaxTrials;
+    unsigned int instance_Seed;
+    int instance_HashingUsed;
+    HashTable *instance_HTable;
+    
+    double instance_TimeLimit;
+    int instance_TraceLevel;
+    int instance_MergingUsed;
+    int instance_MaxCandidates;
+    int *instance_BestTour;
+    int instance_Dimension;
+    int instance_CandidateSetSymmetric;
+    double instance_Excess;
+    int instance_ProblemType;
+    struct Node *instance_FirstNode;
+    unsigned *instance_Rand;
+    unsigned instance_Hash;
+    
+    // State management
+    bool initialized;
+    bool problem_loaded;
+    bool structures_allocated;
+    
+    // Helper methods for state management
+    void install_globals();
+    void uninstall_globals();
+    void copy_globals_to_instance();
+    void allocate_cstrings();
+    void deallocate_cstrings();
+    
+    // Internal helper methods (called by public methods or solve_with_trajectory)
+    // These assume the global lock is held and LKH globals are installed.
+    bool read_parameters_internal();
+    bool read_problem_internal();
+    bool allocate_structures_internal();
+    bool create_candidate_set_internal();
+    void initialize_statistics_internal();
+    bool choose_initial_tour_internal();
+    long long lin_kernighan_internal();
+    bool record_better_tour_internal();
+    bool record_best_tour_internal();
+    bool adjust_candidate_set_internal();
+    bool prepare_kicking_internal();
+    void reset_node_tour_fields_internal();
+    void select_random_first_node_internal();
+    void finalize_tour_from_best_suc_internal();
+    long long calculate_penalty_internal();
+    void hash_initialize_internal();
+    void hash_insert_internal(unsigned hash_val, long long cost);
+    long long calculate_tour_cost_internal();
+    // Note: initialize_run_globals_internal is not strictly needed as the public one handles it well.
+    
+public:
+    // Constructor/Destructor
+    LKHSolver();
+    ~LKHSolver();
+    
+    // File management
+    void set_parameter_file(const std::string& filename);
+    void set_problem_file(const std::string& filename);
+    void set_tour_file(const std::string& filename);
+    void set_pi_file(const std::string& filename);
+    void set_initial_tour_file(const std::string& filename);
+    
+    // Initialization
+    bool read_parameters();
+    bool read_problem();
+    bool allocate_structures();
+    void initialize_run_globals(unsigned int seed_val);
+    
+    // Core solver functions
+    bool create_candidate_set();
+    void initialize_statistics();
+    bool choose_initial_tour();
+    long long lin_kernighan();
+    bool record_better_tour();
+    bool record_best_tour();
+    bool adjust_candidate_set();
+    bool prepare_kicking();
+    
+    // State management functions
+    void reset_node_tour_fields();
+    void select_random_first_node();
+    void finalize_tour_from_best_suc();
+    long long calculate_penalty();
+    
+    // Hash functions
+    void hash_initialize();
+    void hash_insert(unsigned hash_val, long long cost);
+    
+    // Getters and setters
+    long long get_best_cost() const { return instance_BestCost; }
+    long long get_better_cost() const { return instance_BetterCost; }
+    long long get_better_penalty() const { return instance_BetterPenalty; }
+    long long get_current_penalty() const { return instance_CurrentPenalty; }
+    int get_dimension() const { return instance_Dimension; }
+    int get_first_node_id() const;
+    int get_trial_number() const { return instance_Trial; }
+    bool is_hashing_used() const { return instance_HashingUsed != 0; }
+    unsigned get_lkh_hash() const { return instance_Hash; }
+    
+    void set_better_cost(long long cost) { instance_BetterCost = cost; }
+    void set_better_penalty(long long penalty) { instance_BetterPenalty = penalty; }
+    void set_current_penalty(long long penalty) { instance_CurrentPenalty = penalty; }
+    void set_trial_number(int trial) { instance_Trial = trial; }
+    
+    // Tour access
+    std::vector<int> get_best_tour();
+    
+    // High-level solver interface
+    long long solve_with_trajectory(int max_trials = 10, double time_limit = 3600.0);
+    
+    // Validation
+    bool validate_solver_state(bool fix_issues = true);
+    
+    // Calculate actual tour cost from current tour structure
+    long long calculate_tour_cost();
+};
+
+// Implementation of LKHSolver methods
+
+LKHSolver::LKHSolver() 
+    : param_file_cstr(nullptr), problem_file_cstr(nullptr), tour_file_cstr(nullptr),
+      pi_file_cstr(nullptr), initial_tour_file_cstr(nullptr),
+      instance_NodeSet(nullptr), instance_HTable(nullptr), instance_BestTour(nullptr),
+      instance_FirstNode(nullptr), instance_Rand(nullptr),
+      initialized(false), problem_loaded(false), structures_allocated(false) {
+    
+    // Initialize instance variables with default values
+    instance_StartTime = 0.0;
+    instance_MaxMatrixDimension = 0;
+    instance_CTSPTransform = 0;
+    instance_GTSPSets = 0;
+    instance_DimensionSaved = 0;
+    instance_MM = 0;
+    instance_Precision = 1;
+    instance_Norm = 0;
+    
+    instance_BestCost = LLONG_MAX;
+    instance_BetterCost = LLONG_MAX;
+    instance_BestPenalty = LLONG_MAX;
+    instance_BetterPenalty = LLONG_MAX;
+    instance_CurrentPenalty = LLONG_MAX;
+    instance_LowerBound = 0.0;
+    
+    instance_Runs = 1;
+    instance_Run = 1;
+    instance_Trial = 1;
+    instance_MaxTrials = 0;
+    instance_Seed = 1;
+    instance_HashingUsed = 0;
+    
+    instance_TimeLimit = 3600.0;
+    instance_TraceLevel = 0;
+    instance_MergingUsed = 0;
+    instance_MaxCandidates = 0;
+    instance_Dimension = 0;
+    instance_CandidateSetSymmetric = 0;
+    instance_Excess = 0.0;
+    instance_ProblemType = 0;
+    instance_Hash = 0;
 }
 
-// Utility function to check if the solver's internal state is valid and consistent
-bool validate_solver_state(bool fix_issues = true) {
-    printf("PY_WRAP_DEBUG: Validating solver state...\n");
+LKHSolver::~LKHSolver() {
+    deallocate_cstrings();
+    // Note: LKH structures are typically managed by LKH itself
+    // but we might need to add cleanup for instance-specific allocations
+}
+
+void LKHSolver::allocate_cstrings() {
+    deallocate_cstrings(); // Clean up any existing allocations
     
+    if (!param_file_path.empty()) {
+        param_file_cstr = new char[param_file_path.length() + 1];
+        strcpy(param_file_cstr, param_file_path.c_str());
+    }
+    
+    if (!problem_file_path.empty()) {
+        problem_file_cstr = new char[problem_file_path.length() + 1];
+        strcpy(problem_file_cstr, problem_file_path.c_str());
+    }
+    
+    if (!tour_file_path.empty()) {
+        tour_file_cstr = new char[tour_file_path.length() + 1];
+        strcpy(tour_file_cstr, tour_file_path.c_str());
+    }
+    
+    if (!pi_file_path.empty()) {
+        pi_file_cstr = new char[pi_file_path.length() + 1];
+        strcpy(pi_file_cstr, pi_file_path.c_str());
+    }
+    
+    if (!initial_tour_file_path.empty()) {
+        initial_tour_file_cstr = new char[initial_tour_file_path.length() + 1];
+        strcpy(initial_tour_file_cstr, initial_tour_file_path.c_str());
+    }
+}
+
+void LKHSolver::deallocate_cstrings() {
+    delete[] param_file_cstr; param_file_cstr = nullptr;
+    delete[] problem_file_cstr; problem_file_cstr = nullptr;
+    delete[] tour_file_cstr; tour_file_cstr = nullptr;
+    delete[] pi_file_cstr; pi_file_cstr = nullptr;
+    delete[] initial_tour_file_cstr; initial_tour_file_cstr = nullptr;
+}
+
+void LKHSolver::install_globals() {
+    // Install instance variables into LKH globals
+    // This is called before any LKH function that uses globals
+    extern char *ParameterFileName, *ProblemFileName, *TourFileName, *PiFileName, *InitialTourFileName;
+    extern double StartTime;
+    extern int MaxMatrixDimension, CTSPTransform, GTSPSets, DimensionSaved;
+    extern struct Node *NodeSet, *FirstNode;
+    extern long long MM, BestCost, BetterCost, BestPenalty, BetterPenalty, CurrentPenalty;
+    extern int Precision, Norm, Runs, Run, Trial, MaxTrials, HashingUsed;
+    extern unsigned int Seed;
+    extern HashTable *HTable;
+    extern double TimeLimit, LowerBound;
+    extern int TraceLevel, MergingUsed, MaxCandidates, Dimension, CandidateSetSymmetric, ProblemType;
+    extern int *BestTour;
+    extern double Excess;
+    extern unsigned *Rand;
+    extern unsigned Hash;
+    
+    ParameterFileName = param_file_cstr;
+    ProblemFileName = problem_file_cstr;
+    TourFileName = tour_file_cstr;
+    PiFileName = pi_file_cstr;
+    InitialTourFileName = initial_tour_file_cstr;
+    
+    StartTime = instance_StartTime;
+    MaxMatrixDimension = instance_MaxMatrixDimension;
+    CTSPTransform = instance_CTSPTransform;
+    GTSPSets = instance_GTSPSets;
+    DimensionSaved = instance_DimensionSaved;
+    
+    NodeSet = instance_NodeSet;
+    FirstNode = instance_FirstNode;
+    MM = instance_MM;
+    Precision = instance_Precision;
+    Norm = instance_Norm;
+    
+    BestCost = instance_BestCost;
+    BetterCost = instance_BetterCost;
+    BestPenalty = instance_BestPenalty;
+    BetterPenalty = instance_BetterPenalty;
+    CurrentPenalty = instance_CurrentPenalty;
+    LowerBound = instance_LowerBound;
+    
+    Runs = instance_Runs;
+    Run = instance_Run;
+    Trial = instance_Trial;
+    MaxTrials = instance_MaxTrials;
+    Seed = instance_Seed;
+    HashingUsed = instance_HashingUsed;
+    HTable = instance_HTable;
+    
+    TimeLimit = instance_TimeLimit;
+    TraceLevel = instance_TraceLevel;
+    MergingUsed = instance_MergingUsed;
+    MaxCandidates = instance_MaxCandidates;
+    BestTour = instance_BestTour;
+    Dimension = instance_Dimension;
+    CandidateSetSymmetric = instance_CandidateSetSymmetric;
+    Excess = instance_Excess;
+    ProblemType = instance_ProblemType;
+    Rand = instance_Rand;
+    Hash = instance_Hash;
+}
+
+void LKHSolver::uninstall_globals() {
+    // Copy globals back to instance variables after LKH function calls
+    copy_globals_to_instance();
+}
+
+void LKHSolver::copy_globals_to_instance() {
+    extern double StartTime;
+    extern int MaxMatrixDimension, CTSPTransform, GTSPSets, DimensionSaved;
+    extern struct Node *NodeSet, *FirstNode;
+    extern long long MM, BestCost, BetterCost, BestPenalty, BetterPenalty, CurrentPenalty;
+    extern int Precision, Norm, Runs, Run, Trial, MaxTrials, HashingUsed;
+    extern unsigned int Seed;
+    extern HashTable *HTable;
+    extern double TimeLimit, LowerBound;
+    extern int TraceLevel, MergingUsed, MaxCandidates, Dimension, CandidateSetSymmetric, ProblemType;
+    extern int *BestTour;
+    extern double Excess;
+    extern unsigned *Rand;
+    extern unsigned Hash;
+
+    // LKH Global char* filenames that might be changed by LKH
+    extern char *ParameterFileName, *ProblemFileName, *TourFileName, *PiFileName, *InitialTourFileName;
+
+    instance_StartTime = StartTime;
+    instance_MaxMatrixDimension = MaxMatrixDimension;
+    instance_CTSPTransform = CTSPTransform;
+    instance_GTSPSets = GTSPSets;
+    instance_DimensionSaved = DimensionSaved;
+    
+    instance_NodeSet = NodeSet;
+    instance_FirstNode = FirstNode;
+    instance_MM = MM;
+    instance_Precision = Precision;
+    instance_Norm = Norm;
+    
+    instance_BestCost = BestCost;
+    instance_BetterCost = BetterCost;
+    instance_BestPenalty = BestPenalty;
+    instance_BetterPenalty = BetterPenalty;
+    instance_CurrentPenalty = CurrentPenalty;
+    instance_LowerBound = LowerBound;
+    
+    instance_Runs = Runs;
+    instance_Run = Run;
+    instance_Trial = Trial;
+    instance_MaxTrials = MaxTrials;
+    instance_Seed = Seed;
+    instance_HashingUsed = HashingUsed;
+    instance_HTable = HTable;
+    
+    instance_TimeLimit = TimeLimit;
+    instance_TraceLevel = TraceLevel;
+    instance_MergingUsed = MergingUsed;
+    instance_MaxCandidates = MaxCandidates;
+    instance_BestTour = BestTour;
+    instance_Dimension = Dimension;
+    instance_CandidateSetSymmetric = CandidateSetSymmetric;
+    instance_Excess = Excess;
+    instance_ProblemType = ProblemType;
+    instance_Rand = Rand;
+    instance_Hash = Hash;
+
+    // Helper lambda to update instance string and cstr from LKH global char*
+    auto update_instance_filename = [](const char* lkh_global_filename, std::string& instance_path_str, char*& instance_cstr, const char* filename_type) {
+        if (lkh_global_filename != nullptr) {
+            if (instance_cstr == nullptr || strcmp(lkh_global_filename, instance_cstr) != 0) {
+                printf("LKHSolver: Global %s ('%s') differs from instance cstr ('%s'). Updating instance.\n",
+                       filename_type, lkh_global_filename, instance_cstr ? instance_cstr : "null");
+                instance_path_str = lkh_global_filename;
+                delete[] instance_cstr;
+                instance_cstr = new char[instance_path_str.length() + 1];
+                strcpy(instance_cstr, instance_path_str.c_str());
+            }
+        } else {
+            if (instance_cstr != nullptr) {
+                printf("LKHSolver: Global %s is null, but instance cstr ('%s') was set. Clearing instance.\n",
+                       filename_type, instance_cstr);
+                delete[] instance_cstr;
+                instance_cstr = nullptr;
+                instance_path_str.clear();
+            }
+        }
+    };
+
+    // Synchronize filename paths that LKH might have modified
+    update_instance_filename(ParameterFileName, param_file_path, param_file_cstr, "ParameterFileName");
+    update_instance_filename(ProblemFileName, problem_file_path, problem_file_cstr, "ProblemFileName");
+    update_instance_filename(TourFileName, tour_file_path, tour_file_cstr, "TourFileName");
+    update_instance_filename(PiFileName, pi_file_path, pi_file_cstr, "PiFileName");
+    update_instance_filename(InitialTourFileName, initial_tour_file_path, initial_tour_file_cstr, "InitialTourFileName");
+}
+
+// File management methods
+void LKHSolver::set_parameter_file(const std::string& filename) {
+    param_file_path = filename;
+    allocate_cstrings();
+}
+
+void LKHSolver::set_problem_file(const std::string& filename) {
+    problem_file_path = filename;
+    allocate_cstrings();
+}
+
+void LKHSolver::set_tour_file(const std::string& filename) {
+    tour_file_path = filename;
+    allocate_cstrings();
+}
+
+void LKHSolver::set_pi_file(const std::string& filename) {
+    pi_file_path = filename;
+    allocate_cstrings();
+}
+
+void LKHSolver::set_initial_tour_file(const std::string& filename) {
+    initial_tour_file_path = filename;
+    allocate_cstrings();
+}
+
+// Core functionality implementation
+bool LKHSolver::read_parameters() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    try {
+        install_globals();
+        ReadParameters();
+        uninstall_globals();
+        initialized = true;
+        return true;
+    } catch (...) {
+        uninstall_globals();
+        return false;
+    }
+}
+
+bool LKHSolver::read_problem() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    try {
+        install_globals();
+        ReadProblem();
+        uninstall_globals();
+        problem_loaded = true;
+        return true;
+    } catch (...) {
+        uninstall_globals();
+        return false;
+    }
+}
+
+bool LKHSolver::allocate_structures() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    try {
+        install_globals();
+        AllocateStructures();
+        uninstall_globals();
+        structures_allocated = true;
+        return true;
+    } catch (...) {
+        uninstall_globals();
+        return false;
+    }
+}
+
+void LKHSolver::initialize_run_globals(unsigned int seed_val) {
+    instance_BestCost = LLONG_MAX;
+    instance_BestPenalty = LLONG_MAX;
+    instance_CurrentPenalty = LLONG_MAX;
+    instance_Runs = 1;
+    instance_Run = 1;
+    instance_Seed = seed_val;
+    
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    install_globals();
+    SRandom(seed_val);
+    uninstall_globals();
+    
+    printf("LKHSolver: Run globals initialized. Seed=%u, BestCost=%lld\n", seed_val, instance_BestCost);
+}
+
+bool LKHSolver::create_candidate_set() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    try {
+        install_globals();
+        CreateCandidateSet();
+        uninstall_globals();
+        return true;
+    } catch (...) {
+        uninstall_globals();
+            return false;
+    }
+}
+
+void LKHSolver::initialize_statistics() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    install_globals();
+    InitializeStatistics();
+    uninstall_globals();
+}
+
+bool LKHSolver::choose_initial_tour() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    try {
+        install_globals();
+        ChooseInitialTour();
+        uninstall_globals();
+        return true;
+    } catch (...) {
+        uninstall_globals();
+        return false;
+    }
+}
+
+long long LKHSolver::lin_kernighan() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    try {
+        install_globals();
+        long long result = LinKernighan();
+        uninstall_globals();
+        return result;
+    } catch (...) {
+        uninstall_globals();
+        return LLONG_MAX;
+    }
+}
+
+bool LKHSolver::record_better_tour() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    try {
+        install_globals();
+        RecordBetterTour();
+        uninstall_globals();
+        return true;
+    } catch (...) {
+        uninstall_globals();
+        return false;
+    }
+}
+
+bool LKHSolver::record_best_tour() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    try {
+        install_globals();
+        RecordBestTour();
+        uninstall_globals();
+        return true;
+    } catch (...) {
+        uninstall_globals();
+            return false;
+    }
+        }
+
+bool LKHSolver::adjust_candidate_set() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    try {
+        install_globals();
+        AdjustCandidateSet();
+        uninstall_globals();
+        return true;
+    } catch (...) {
+        uninstall_globals();
+        return false;
+    }
+}
+
+bool LKHSolver::prepare_kicking() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    try {
+        install_globals();
+        PrepareKicking();
+        uninstall_globals();
+        return true;
+    } catch (...) {
+        uninstall_globals();
+        return false;
+    }
+}
+
+// State management functions implementation
+void LKHSolver::reset_node_tour_fields() {
+    if (!instance_FirstNode) {
+        printf("ERROR: FirstNode is NULL in reset_node_tour_fields\n");
+        return;
+    }
+    
+    Node *t = instance_FirstNode;
+    do {
+        t->OldPred = t->OldSuc = t->NextBestSuc = t->BestSuc = 0;
+    } while ((t = t->Suc) != instance_FirstNode);
+    printf("LKHSolver: Node tour fields reset\n");
+}
+
+void LKHSolver::select_random_first_node() {
+    if (instance_Dimension <= 0) {
+        printf("ERROR: Dimension invalid in select_random_first_node\n");
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    install_globals();
+    
+    extern unsigned Random(void);  // Match the declaration in LKH.h
+    if (instance_Dimension == instance_DimensionSaved) {
+        instance_FirstNode = &instance_NodeSet[1 + Random() % instance_Dimension];
+    } else {
+        for (int i = Random() % instance_Dimension; i > 0; i--)
+            instance_FirstNode = instance_FirstNode->Suc;
+    }
+    
+    uninstall_globals();
+    
+    if (instance_FirstNode) 
+        printf("LKHSolver: Random FirstNode selected: ID %d\n", instance_FirstNode->Id);
+    else 
+        printf("ERROR: FirstNode became NULL after selection\n");
+}
+
+void LKHSolver::finalize_tour_from_best_suc() {
+    if (!instance_FirstNode) {
+        printf("ERROR: FirstNode is NULL in finalize_tour_from_best_suc\n");
+        return;
+    }
+    
+    printf("LKHSolver: Finalizing tour from BestSuc chain...\n");
+    
+    Node *t = instance_FirstNode;
+    if (instance_Norm == 0 || instance_MaxTrials == 0 || !t->BestSuc) {
+        printf("LKHSolver: Setting BestSuc = Suc for all nodes as fallback\n");
+        Node* current = instance_FirstNode;
+        do {
+            if (!current->BestSuc) current->BestSuc = current->Suc;
+            current = current->Suc;
+        } while (current != instance_FirstNode);
+    }
+    
+    t = instance_FirstNode;
+    do {
+        if (!t->BestSuc) {
+            printf("WARNING: Node %d BestSuc is NULL during finalization. Using t->Suc.\n", t->Id);
+            t->BestSuc = t->Suc;
+        }
+        (t->Suc = t->BestSuc)->Pred = t;
+    } while ((t = t->BestSuc) != instance_FirstNode);
+    
+    if (instance_HashingUsed) {
+        instance_Hash = 0;
+        t = instance_FirstNode;
+        do {
+            instance_Hash ^= instance_Rand[t->Id] * instance_Rand[t->Suc->Id];
+        } while ((t = t->Suc) != instance_FirstNode);
+        printf("LKHSolver: Final Hash recalculated: %u\n", instance_Hash);
+    }
+}
+
+long long LKHSolver::calculate_penalty() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    install_globals();
+    long long p = Penalty();
+    uninstall_globals();
+    printf("LKHSolver: Penalty calculated: %lld\n", p);
+    return p;
+}
+
+void LKHSolver::hash_initialize() {
+    if (instance_HTable) {
+        std::lock_guard<std::mutex> lock(lkh_global_mutex);
+        install_globals();
+        HashInitialize(instance_HTable);
+        uninstall_globals();
+        printf("LKHSolver: HashInitialize called\n");
+    } else {
+        printf("ERROR: HTable is NULL in hash_initialize\n");
+    }
+}
+
+void LKHSolver::hash_insert(unsigned hash_val, long long cost) {
+    if (instance_HTable) {
+        std::lock_guard<std::mutex> lock(lkh_global_mutex);
+        install_globals();
+        HashInsert(instance_HTable, hash_val, cost);
+        uninstall_globals();
+    } else {
+        printf("ERROR: HTable is NULL in hash_insert\n");
+    }
+}
+
+int LKHSolver::get_first_node_id() const {
+    if (instance_FirstNode) return instance_FirstNode->Id;
+    return -1;
+}
+
+std::vector<int> LKHSolver::get_best_tour() {
+    if (instance_BestTour == nullptr || instance_Dimension <= 0) {
+        throw std::runtime_error("BestTour is not available or Dimension is invalid");
+    }
+    
+    std::vector<int> tour;
+    for (int i = 1; i <= instance_Dimension + 1; i++) {
+        tour.push_back(instance_BestTour[i]);
+    }
+    return tour;
+}
+
+bool LKHSolver::validate_solver_state(bool fix_issues) {
+    printf("LKHSolver: Validating solver state...\n");
     bool is_valid = true;
     
-    // Check if core structures are initialized
-    if (NodeSet == nullptr) {
+    if (instance_NodeSet == nullptr) {
         printf("ERROR: NodeSet is null\n");
         is_valid = false;
     } else {
-        printf("PY_WRAP_DEBUG: NodeSet is at %p\n", (void*)NodeSet);
+        printf("LKHSolver: NodeSet is valid\n");
     }
     
-    if (Dimension <= 0) {
-        printf("ERROR: Dimension is invalid (%d)\n", Dimension);
+    if (instance_Dimension <= 0) {
+        printf("ERROR: Dimension is invalid (%d)\n", instance_Dimension);
         is_valid = false;
     } else {
-        printf("PY_WRAP_DEBUG: Dimension is %d\n", Dimension);
+        printf("LKHSolver: Dimension is %d\n", instance_Dimension);
     }
     
-    if (FirstNode == nullptr) {
+    if (instance_FirstNode == nullptr) {
         printf("ERROR: FirstNode is null\n");
-        
-        // Try to fix FirstNode if requested and possible
-        if (fix_issues && NodeSet != nullptr && Dimension > 0) {
-            printf("PY_WRAP_DEBUG: Attempting to initialize FirstNode from NodeSet\n");
-            FirstNode = &NodeSet[1]; // First node is typically at index 1 in NodeSet
+        if (fix_issues && instance_NodeSet != nullptr && instance_Dimension > 0) {
+            printf("LKHSolver: Attempting to initialize FirstNode\n");
+            instance_FirstNode = &instance_NodeSet[1];
             
-            // Create circular linked list of nodes
-            Node *Prev = FirstNode;
-            for (int i = 2; i <= Dimension; i++) {
-                Node *N = &NodeSet[i];
+            Node *Prev = instance_FirstNode;
+            for (int i = 2; i <= instance_Dimension; i++) {
+                Node *N = &instance_NodeSet[i];
                 N->Pred = Prev;
                 Prev->Suc = N;
                 Prev = N;
             }
-            Prev->Suc = FirstNode;
-            FirstNode->Pred = Prev;
+            Prev->Suc = instance_FirstNode;
+            instance_FirstNode->Pred = Prev;
             
-            printf("PY_WRAP_DEBUG: FirstNode initialized. FirstNode->Id=%d\n", FirstNode->Id);
-            is_valid = true; // We've fixed the issue
-        } else {
+            printf("LKHSolver: FirstNode initialized\n");
+            is_valid = true;
+    } else {
             is_valid = false;
         }
     } else {
-        printf("PY_WRAP_DEBUG: FirstNode is at %p, Id=%d\n", (void*)FirstNode, FirstNode->Id);
-        
-        // Check if the linked list is properly circular
-        if (FirstNode->Pred == nullptr || FirstNode->Suc == nullptr) {
-            printf("ERROR: FirstNode is not properly linked (Pred=%p, Suc=%p)\n",
-                   (void*)FirstNode->Pred, (void*)FirstNode->Suc);
-            
-            // Try to fix the circular linked list if requested and possible
-            if (fix_issues && NodeSet != nullptr && Dimension > 0) {
-                printf("PY_WRAP_DEBUG: Attempting to repair node linkage\n");
-                Node *Prev = FirstNode;
-                for (int i = 2; i <= Dimension; i++) {
-                    Node *N = &NodeSet[i];
-                    N->Pred = Prev;
-                    Prev->Suc = N;
-                    Prev = N;
-                }
-                Prev->Suc = FirstNode;
-                FirstNode->Pred = Prev;
-                printf("PY_WRAP_DEBUG: Node linkage repaired\n");
-                is_valid = true; // We've fixed the issue
-            } else {
-                is_valid = false;
-            }
-        }
+        printf("LKHSolver: FirstNode is valid (Id=%d)\n", instance_FirstNode->Id);
     }
     
-    printf("PY_WRAP_DEBUG: Solver state validation %s\n", is_valid ? "passed" : "failed");
+    printf("LKHSolver: State validation %s\n", is_valid ? "passed" : "failed");
     return is_valid;
 }
 
-// =====================================================================================
-// Custom implementation of CreateCandidateSet with explicit parameters
-// =====================================================================================
-
-bool create_candidate_set_explicit() {
+// Calculate actual tour cost from current tour structure (public, with lock)
+long long LKHSolver::calculate_tour_cost() {
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    install_globals();
     try {
-        // Check global variables before we start
-        if (FirstNode == nullptr) {
-            printf("ERROR: FirstNode is null, cannot create candidate set\n");
-            return false;
+        long long cost = calculate_tour_cost_internal();
+        uninstall_globals();
+        return cost;
+    } catch (...) {
+        uninstall_globals();
+        throw; // Rethrow the exception
+    }
+}
+
+// High-level solver interface
+long long LKHSolver::solve_with_trajectory(int max_trials, double time_limit) {
+    // Acquire lock for the entire duration of the solve process
+    std::lock_guard<std::mutex> lock(lkh_global_mutex);
+    install_globals(); // Install instance state into LKH globals once
+
+    try {
+
+        // Initialize for this run (operates on installed globals)
+        // initialize_run_globals calls SRandom, which is global.
+        // It also updates instance variables which are then re-installed by install_globals if needed,
+        // but here, globals are already installed. So, it directly updates instance_Seed.
+        instance_Seed = instance_Seed; // This effectively is already set by constructor or previous run
+        SRandom(instance_Seed); // Set LKH seed
+        instance_BestCost = LLONG_MAX;     // These are for the current run's tracking within LKH context
+        instance_BestPenalty = LLONG_MAX;
+        instance_CurrentPenalty = LLONG_MAX;
+        instance_Runs = 1;
+        instance_Run = 1;
+        // Make sure LKH globals reflect this for the run
+        BestCost = instance_BestCost;
+        BestPenalty = instance_BestPenalty;
+        CurrentPenalty = instance_CurrentPenalty;
+        Runs = instance_Runs;
+        Run = instance_Run;
+
+        // // Initialize and load data if not already done (respecting instance state)
+        // if (!read_parameters_internal()) { 
+        //     throw std::runtime_error("Failed to read parameters");
+        // }
+        
+        // if (!read_problem_internal()) { 
+        //     throw std::runtime_error("Failed to read problem");
+        // }
+        
+        // if (!allocate_structures_internal()) { 
+        //     throw std::runtime_error("Failed to allocate structures");
+        // }
+        
+        // Validate state (operates on installed globals)
+        if (!validate_solver_state(true)) { // validate_solver_state can remain public as it's read-only mostly
+            throw std::runtime_error("Solver state validation failed");
         }
-        if (Dimension <= 0) {
-            printf("ERROR: Dimension is invalid (%d), cannot create candidate set\n", Dimension);
-            return false;
-        }
-        if (MaxCandidates < 0) {
-            printf("ERROR: MaxCandidates is invalid (%d), cannot create candidate set\n", MaxCandidates);
-            return false;
+
+        // Create candidate set (operates on installed globals)
+        if (!create_candidate_set_internal()) { 
+            throw std::runtime_error("Failed to create candidate set");
         }
         
-        printf("Creating candidates explicitly...\n");
+        // Initialize statistics (operates on installed globals)
+        initialize_statistics_internal(); 
+
+        // Validate state (operates on installed globals)
+        if (!validate_solver_state(true)) { // validate_solver_state can remain public as it's read-only mostly
+            throw std::runtime_error("Solver state validation failed");
+        }
         
-        // Additional checks on FirstNode structure
-        printf("PY_WRAP_DEBUG: FirstNode->Id=%d, FirstNode->Pred=%p, FirstNode->Suc=%p\n", 
-               FirstNode->Id, (void*)FirstNode->Pred, (void*)FirstNode->Suc);
-               
-        // Check if the linked list is properly circular
-        if (FirstNode->Pred == nullptr || FirstNode->Suc == nullptr) {
-            printf("ERROR: FirstNode is not properly linked (Pred=%p, Suc=%p)\n",
-                   (void*)FirstNode->Pred, (void*)FirstNode->Suc);
-                   
-            // Attempt to fix the circular linked list if needed
-            if (NodeSet != nullptr && Dimension > 0) {
-                printf("PY_WRAP_DEBUG: Attempting to repair node linkage\n");
-                Node *Prev = FirstNode;
-                for (int i = 2; i <= Dimension; i++) {
-                    Node *N = &NodeSet[i];
-                    N->Pred = Prev;
-                    Prev->Suc = N;
-                    Prev = N;
+        // Main solver loop logic (directly calls LKH functions or internal helpers)
+        reset_node_tour_fields_internal(); 
+        
+        instance_BetterCost = LLONG_MAX; 
+        instance_BetterPenalty = instance_CurrentPenalty = LLONG_MAX;
+        instance_MaxTrials = max_trials; // LKH will use MaxTrials global
+        MaxTrials = instance_MaxTrials; // Ensure global is set
+        TimeLimit = time_limit; // Set LKH's global TimeLimit
+        instance_TimeLimit = time_limit; // And instance
+        
+        if (instance_MaxTrials > 0) {
+            if (instance_HashingUsed) { // HashingUsed is already a global
+                hash_initialize_internal(); 
+            }
+        } else {
+            Trial = 1; instance_Trial = 1;
+            if (!choose_initial_tour_internal()) { 
+                throw std::runtime_error("ChooseInitialTour failed");
+            }
+            long long current_p = calculate_penalty_internal(); 
+            CurrentPenalty = current_p; instance_CurrentPenalty = current_p;
+            BetterPenalty = current_p; instance_BetterPenalty = current_p;
+        }
+        
+        if (!prepare_kicking_internal()) { 
+            throw std::runtime_error("Failed to prepare kicking");
+        }
+        
+        double solve_start_time = GetTime(); // LKH GetTime
+        StartTime = solve_start_time; // LKH global StartTime
+        instance_StartTime = solve_start_time; // And instance
+        
+        for (int trial_count = 1; trial_count <= MaxTrials; trial_count++) {
+            if (trial_count > 1 && (GetTime() - StartTime) >= TimeLimit) {
+                printf("LKHSolver: Time limit exceeded during trials\n");
+                break;
+            }
+            
+            Trial = trial_count; instance_Trial = trial_count;
+            
+            select_random_first_node_internal(); 
+            
+            if (!choose_initial_tour_internal()) { 
+                printf("LKHSolver: Warning - ChooseInitialTour failed for trial %d\n", trial_count);
+                continue;
+            }
+            
+            long long cost_after_lk = lin_kernighan_internal(); 
+            
+            if (cost_after_lk == LLONG_MAX) {
+                printf("LKHSolver: Error in LinKernighan for trial %d\n", trial_count);
+                continue;
+            }
+            
+            // LinKernighan updates global CurrentPenalty and global Hash.
+            // Cost returned by LinKernighan is already divided by Precision.
+            // The instance variables (instance_CurrentPenalty, instance_Hash) will be updated by uninstall_globals.
+
+            bool improved = false;
+            if (CurrentPenalty < BetterPenalty || 
+                (CurrentPenalty == BetterPenalty && cost_after_lk < BetterCost)) {
+                improved = true;
+                
+                printf("LKHSolver: Trial %d: Improvement! Cost=%lld, Penalty=%lld. (Old BetterCost: %lld, Old BetterPenalty: %lld)\n", 
+                       trial_count, cost_after_lk, CurrentPenalty, BetterCost, BetterPenalty);
+                
+                BetterCost = cost_after_lk;  // RE-ADD: Align with py_lkh_wrapper_base.cpp logic
+                BetterPenalty = CurrentPenalty; // RE-ADD: Align with py_lkh_wrapper_base.cpp logic
+            
+                if (!record_better_tour_internal()) { 
+                    printf("LKHSolver: Warning - RecordBetterTour failed in trial %d\n", trial_count);
                 }
-                Prev->Suc = FirstNode;
-                FirstNode->Pred = Prev;
-                printf("PY_WRAP_DEBUG: Node linkage repaired\n");
+                
+                if (!adjust_candidate_set_internal()) { 
+                    printf("LKHSolver: Warning - AdjustCandidateSet failed in trial %d\n", trial_count);
+                }
+                
+                if (!prepare_kicking_internal()) { 
+                    printf("LKHSolver: Warning - PrepareKicking failed in trial %d\n", trial_count);
+                }
+                
+                if (instance_HashingUsed) {
+                    // HashInitialize might not be needed here again unless specific LKH logic requires it
+                    // HashInsert uses the global 'Hash' which LinKernighan would have updated via StoreTour
+                    hash_insert_internal(Hash, cost_after_lk); 
+                }
             } else {
-                return false;
+                 printf("LKHSolver: Trial %d: No improvement. Cost=%lld, Penalty=%lld. (Current BetterCost: %lld, BetterPenalty: %lld)\n", 
+                       trial_count, cost_after_lk, CurrentPenalty, BetterCost, BetterPenalty);
             }
         }
         
-        // Implement the functionality of CreateCandidateSet directly
-        long long Cost, MaxAlpha;
-        Node *Na;
-        int i;
-        double EntryTime = GetTime();
-
-        Norm = 9999;
-        if (C == C_EXPLICIT) {
-            printf("Processing C_EXPLICIT - scaling costs by precision\n");
-            Na = FirstNode;
-            do {
-                for (i = 1; i < Na->Id; i++)
-                    Na->C[i] *= Precision;
-            } while ((Na = Na->Suc) != FirstNode);
+        finalize_tour_from_best_suc_internal(); 
+        
+        // if (BetterPenalty != LLONG_MAX) {
+        //     CurrentPenalty = BetterPenalty; 
+        // }
+        
+        if (!record_best_tour_internal()) { 
+            printf("LKHSolver: Warning - RecordBestTour failed\n");
         }
         
-        printf("Setting Pi values to 0\n");
-        Na = FirstNode;
-        do
-            Na->Pi = 0;
-        while ((Na = Na->Suc) != FirstNode);
+        long long actual_tour_cost = calculate_tour_cost_internal(); 
+        printf("LKHSolver: Calculated actual tour cost (from final Suc pointers): %lld\n", actual_tour_cost);
+        printf("LKHSolver: LKH global BestCost after run: %lld\n", BetterCost); 
+        //printf("LKHSolver: Instance BestCost before uninstall: %lld\n", instance_BestCost);
+
+
+        uninstall_globals(); 
+        // After uninstall, instance_BestCost should be LKH's global BestCost
+        printf("LKHSolver: Instance BestCost after uninstall (should match LKH global BestCost): %lld\n", BetterCost);
         
-        printf("Computing Ascent\n");
-        Cost = Ascent();
-        
-        if (MaxCandidates > 0) {
-            printf("Computing Minimum1TreeCost (sparse=0)\n");
-            Cost = Minimum1TreeCost(0);
-        } else {
-            printf("Computing Minimum1TreeCost (sparse=1)\n");
-            Cost = Minimum1TreeCost(1);
-        }
-        
-        printf("Setting LowerBound\n");
-        LowerBound = (double) Cost / Precision;
-        
-        printf("Computing MaxAlpha\n");
-        MaxAlpha = (long long) fabs(Excess * Cost);
-        
-        printf("Generating candidates (MaxCandidates=%d, MaxAlpha=%lld, Symmetric=%d)\n", 
-               MaxCandidates, MaxAlpha, CandidateSetSymmetric);
-        GenerateCandidates(MaxCandidates, MaxAlpha, CandidateSetSymmetric);
+        // The 'actual_tour_cost' is calculated from the Suc pointers of the final tour.
+        // LKH's BestCost (now in instance_BestCost) is what LKH considers its best, scaled.
+        // We should return the unscaled actual cost of the tour structure that LKH settled on.
+        // If penalties are involved, BestCost might be cost+penalty.
+        // calculate_tour_cost_internal already divides by precision.
+        // Return LKH's recorded BestCost, which should be the most reliable.
+        return BetterCost;
 
-        // Validation step from original function
-        if (MaxTrials > 0) {
-            printf("Validating that each node has candidates\n");
-            Na = FirstNode;
-            do {
-                if (!Na->CandidateSet || !Na->CandidateSet[0].To) {
-                    if (MaxCandidates == 0) {
-                        printf("ERROR: MAX_CANDIDATES = 0: Node %d has no candidates\n", Na->Id);
-                        return false;
-                    } else {
-                        printf("ERROR: Node %d has no candidates\n", Na->Id);
-                        return false;
-                    }
-                }
-            } while ((Na = Na->Suc) != FirstNode);
-        }
-        
-        // Finalize like the original function
-        if (C == C_EXPLICIT) {
-            printf("Finalizing for C_EXPLICIT\n");
-            Na = FirstNode;
-            do
-                for (i = 1; i < Na->Id; i++)
-                    Na->C[i] += Na->Pi + NodeSet[i].Pi;
-            while ((Na = Na->Suc) != FirstNode);
-        }
-        
-        // Output report
-        CandidateReport();
-        printf("CreateCandidateSet completed in %.2f sec\n", fabs(GetTime() - EntryTime));
-        
-        return true;
-    }
-    catch (const std::exception& e) {
-        printf("Exception in create_candidate_set_explicit: %s\n", e.what());
-        return false;
-    }
-    catch (...) {
-        printf("Unknown exception in create_candidate_set_explicit\n");
-        return false;
+    } catch (const std::exception& e) {
+        printf("LKHSolver: Exception in solve_with_trajectory: %s\n", e.what());
+        uninstall_globals(); 
+        throw; 
+    } catch (...) {
+        printf("LKHSolver: Unknown exception in solve_with_trajectory\n");
+        uninstall_globals(); 
+        throw; 
     }
 }
 
-// =====================================================================================
-// Original safe wrapper functions for LKH functions
-// =====================================================================================
+// ---- Start Internal Helper Methods (without lock/install/uninstall) ----
+// These are called by solve_with_trajectory or other public methods that already hold the lock
+// and assume LKH globals are already set from the instance.
+// They primarily call LKH functions directly.
+// Critical: These internal methods DO NOT call install_globals/uninstall_globals themselves.
+// They also generally DO NOT update instance variables directly unless it's a simple pointer/value
+// that LKH has just set globally and needs to be reflected in the instance for subsequent internal logic
+// *before* the final uninstall_globals(). The main state sync happens in the final uninstall_globals().
 
-// Safe wrapper for CreateCandidateSet - handles global variables properly
-bool safe_create_candidate_set() {
-    try {
-        // The new explicit implementation is safer
-        return create_candidate_set_explicit();
-    }
-    catch (const std::exception& e) {
-        printf("Exception in safe_create_candidate_set: %s\n", e.what());
-        return false;
-    }
-    catch (...) {
-        printf("Unknown exception in safe_create_candidate_set\n");
-        return false;
-    }
+bool LKHSolver::read_parameters_internal() {
+    // Assumes ParameterFileName is set in globals via install_globals()
+    ReadParameters(); 
+    // LKH's ReadParameters might set other globals like ProblemFileName, MaxTrials etc.
+    // These will be copied back to the instance by the outer uninstall_globals().
+    // We only need to update the 'initialized' flag for the instance.
+    initialized = true; 
+    return true;
 }
 
-// Safe wrapper for LinKernighan - handles global variables
-long long safe_lin_kernighan() {
-    try {
-        // Validate required global variables
-        if (FirstNode == nullptr) {
-            printf("ERROR: FirstNode is null, cannot run LinKernighan\n");
-            return LLONG_MAX;
-        }
-
-        // Call the original function
-        return LinKernighan();
-    }
-    catch (const std::exception& e) {
-        printf("Exception in safe_lin_kernighan: %s\n", e.what());
-        return LLONG_MAX;
-    }
-    catch (...) {
-        printf("Unknown exception in safe_lin_kernighan\n");
-        return LLONG_MAX;
-    }
-}
-
-// Safe wrapper for ChooseInitialTour - handles global variables
-bool safe_choose_initial_tour() {
-    try {
-        // Validate required global variables
-        if (FirstNode == nullptr) {
-            printf("ERROR: FirstNode is null, cannot choose initial tour\n");
-            return false;
-        }
-
-        // Call the original function
-        ChooseInitialTour();
-        return true;
-    }
-    catch (const std::exception& e) {
-        printf("Exception in safe_choose_initial_tour: %s\n", e.what());
-        return false;
-    }
-    catch (...) {
-        printf("Unknown exception in safe_choose_initial_tour\n");
-        return false;
-    }
-}
-
-// Safe wrapper for RecordBetterTour - handles global variables
-bool safe_record_better_tour() {
-    try {
-        // Validate required global variables
-        if (FirstNode == nullptr) {
-            printf("ERROR: FirstNode is null, cannot record better tour\n");
-            return false;
-        }
-
-        // Call the original function
-        RecordBetterTour();
-        return true;
-    }
-    catch (const std::exception& e) {
-        printf("Exception in safe_record_better_tour: %s\n", e.what());
-        return false;
-    }
-    catch (...) {
-        printf("Unknown exception in safe_record_better_tour\n");
-        return false;
-    }
-}
-
-// Safe wrapper for AdjustCandidateSet - handles global variables
-bool safe_adjust_candidate_set() {
-    try {
-        // Validate required global variables
-        if (FirstNode == nullptr) {
-            printf("ERROR: FirstNode is null, cannot adjust candidate set\n");
-            return false;
-        }
-
-        // Call the original function
-        AdjustCandidateSet();
-        return true;
-    }
-    catch (const std::exception& e) {
-        printf("Exception in safe_adjust_candidate_set: %s\n", e.what());
-        return false;
-    }
-    catch (...) {
-        printf("Unknown exception in safe_adjust_candidate_set\n");
-        return false;
-    }
-}
-
-// Safe wrapper for PrepareKicking - handles global variables
-bool safe_prepare_kicking() {
-    try {
-        // Validate required global variables
-        if (FirstNode == nullptr) {
-            printf("ERROR: FirstNode is null, cannot prepare kicking\n");
-            return false;
-        }
-
-        // Call the original function
-        PrepareKicking();
-        return true;
-    }
-    catch (const std::exception& e) {
-        printf("Exception in safe_prepare_kicking: %s\n", e.what());
-        return false;
-    }
-    catch (...) {
-        printf("Unknown exception in safe_prepare_kicking\n");
-        return false;
-    }
-}
-
-// Safe wrapper for RecordBestTour - handles global variables
-bool safe_record_best_tour() {
-    try {
-        // Validate required global variables
-        if (FirstNode == nullptr) {
-            printf("ERROR: FirstNode is null, cannot record best tour\n");
-            return false;
-        }
-
-        // Call the original function
-        RecordBestTour();
-        return true;
-    }
-    catch (const std::exception& e) {
-        printf("Exception in safe_record_best_tour: %s\n", e.what());
-        return false;
-    }
-    catch (...) {
-        printf("Unknown exception in safe_record_best_tour\n");
-        return false;
-    }
-}
-
-// Function to access the BestTour array and return it as a vector
-std::vector<int> get_best_tour() {
-    if (BestTour == nullptr || Dimension <= 0) {
-        throw std::runtime_error("BestTour is not available or Dimension is invalid");
-    }
-
-    // Create a vector to hold the tour
-    std::vector<int> tour;
-    
-    // Copy the tour values
-    // Best tour in LKH is stored from 1 to Dimension (1-indexed), and the first node is repeated at the end
-    for (int i = 1; i <= Dimension + 1; i++) {
-        tour.push_back(BestTour[i]);
-    }
-    
-    return tour;
-}
-
-// Function to get the current dimension
-int get_dimension() {
-    return Dimension;
-}
-
-// Function to get the best cost
-long long get_best_cost() {
-    return BestCost;
-}
-
-void read_problem_file(const std::string &problem_file) {
-    // Memory management for LKH's global char* filenames
-    static char *problem_c_str = nullptr;
-    
-    if (problem_c_str) delete[] problem_c_str;
-    problem_c_str = new char[problem_file.length() + 1];
-    strcpy(problem_c_str, problem_file.c_str());
-    ProblemFileName = problem_c_str; // LKH uses this after ReadParameters too
-}
-
-void read_parameter_file(const std::string &param_file) {
-    // Memory management for LKH's global char* filenames
-    static char *param_c_str = nullptr;
-    
-    if (param_c_str) delete[] param_c_str;
-    param_c_str = new char[param_file.length() + 1];
-    strcpy(param_c_str, param_file.c_str());
-    ParameterFileName = param_c_str;
-}
-
-long long solve_and_record_trajectory(const std::string &param_file, const std::string &problem_file) {
-    // Memory management for LKH's global char* filenames
-    // LKH doesn't free these, so we manage them here if we set them.
-    static std::string last_param_file, last_problem_file;
-    static char *param_c_str = nullptr;
-    static char *problem_c_str = nullptr;
-    
-    // Static buffer for empty string parameter
-    static char empty_str[] = "";
-
-    if (param_c_str) delete[] param_c_str;
-    param_c_str = new char[param_file.length() + 1];
-    strcpy(param_c_str, param_file.c_str());
-    ParameterFileName = param_c_str;
-
-    if (problem_c_str) delete[] problem_c_str;
-    problem_c_str = new char[problem_file.length() + 1];
-    strcpy(problem_c_str, problem_file.c_str());
-    ProblemFileName = problem_c_str; // LKH uses this after ReadParameters too
-
-    printf("PY_WRAP_DEBUG: ParameterFileName set to: %s\n", ParameterFileName);
-    printf("PY_WRAP_DEBUG: ProblemFileName set to: %s\n", ProblemFileName);
-
-    // Initialize variables for LKH
-    BestCost = BestPenalty = CurrentPenalty = LLONG_MAX; // Initialize costs
-    Runs = 1; // We are doing one run for trajectory recording
-    Run = 1; 
-    SRandom(1); // Default seed, can be made a parameter
-
-    // 1. Read LKH parameters
-    printf("PY_WRAP_DEBUG: Reading parameters from %s\n", param_file.c_str());
-    ReadParameters();
-    printf("PY_WRAP_DEBUG: Parameters read. MaxCandidates=%d, TraceLevel=%d\n", 
-           MaxCandidates, TraceLevel);
-
-    // 2. Read the TSP problem
-    printf("PY_WRAP_DEBUG: Reading problem from %s\n", problem_file.c_str());
+bool LKHSolver::read_problem_internal() {
+    // Assumes ProblemFileName is set in globals
     ReadProblem();
-    printf("PY_WRAP_DEBUG: Problem read. Dimension=%d, ProblemType=%d\n", 
-           Dimension, ProblemType);
+    problem_loaded = true;
+    return true;
+}
 
-    // 3. Allocate memory for LKH structures
-    printf("PY_WRAP_DEBUG: Allocating structures\n");
+bool LKHSolver::allocate_structures_internal() {
     AllocateStructures();
-    
-    // Validate solver state after initialization
-    if (!validate_solver_state(true)) {
-        printf("ERROR: Solver state validation failed after initialization\n");
-        return LLONG_MAX;
-    }
+    structures_allocated = true;
+    return true;
+}
 
-    // 4. Create candidate set
-    printf("PY_WRAP_DEBUG: Creating candidate set\n");
-    if (!create_candidate_set_explicit()) {
-        printf("ERROR: Failed to create candidate set in solve_and_record_trajectory\n");
-        return LLONG_MAX;
-    }
+bool LKHSolver::create_candidate_set_internal() {
+    CreateCandidateSet();
+    return true;
+}
 
-    // 5. Initialize statistics
-    printf("PY_WRAP_DEBUG: Initializing statistics\n");
+void LKHSolver::initialize_statistics_internal() {
     InitializeStatistics();
-    
-    // Validate solver state again before running the algorithm
-    if (!validate_solver_state(true)) {
-        printf("ERROR: Solver state validation failed before running algorithm\n");
-        return LLONG_MAX;
-    }
+}
 
-    // 6. Run the solver
-    //returned_cost_value = FindTour();
-    long long Cost_2;
-    Node *t;
-    int i2;
-    double EntryTime_2 = GetTime();
+bool LKHSolver::choose_initial_tour_internal() {
+    ChooseInitialTour();
+    return true;
+}
 
-    printf("PY_WRAP_DEBUG: Initializing nodes for solver run\n");
-    t = FirstNode;
-    do
-        t->OldPred = t->OldSuc = t->NextBestSuc = t->BestSuc = 0;
-    while ((t = t->Suc) != FirstNode);
-    
-    BetterCost = LLONG_MAX;
-    BetterPenalty = CurrentPenalty = LLONG_MAX;
-    
-    if (MaxTrials > 0) {
-        printf("PY_WRAP_DEBUG: Using MaxTrials = %d\n", MaxTrials);
-        if (HashingUsed)
-            HashInitialize(HTable);
-    } else {
-        printf("PY_WRAP_DEBUG: MaxTrials = 0, choosing initial tour directly\n");
-        Trial = 1;
-        ChooseInitialTour();
-        CurrentPenalty = LLONG_MAX;
-        CurrentPenalty = BetterPenalty = Penalty();
-    }
-    
-    printf("PY_WRAP_DEBUG: Preparing kicking\n");
+long long LKHSolver::lin_kernighan_internal() {
+    return LinKernighan(); // This will update LKH globals (Cost, CurrentPenalty, Hash, tour structure)
+}
+
+bool LKHSolver::record_better_tour_internal() {
+    RecordBetterTour(); // Updates LKH globals BetterTour, BetterCost, BetterPenalty
+    return true;
+}
+
+bool LKHSolver::record_best_tour_internal() {
+    RecordBestTour(); // Updates LKH globals BestTour, BestCost, BestPenalty
+    return true;
+}
+
+bool LKHSolver::adjust_candidate_set_internal() {
+    AdjustCandidateSet();
+    return true;
+}
+
+bool LKHSolver::prepare_kicking_internal() {
     PrepareKicking();
-    
-    printf("PY_WRAP_DEBUG: Starting trials loop (MaxTrials=%d)\n", MaxTrials);
-    for (Trial = 1; Trial <= MaxTrials; Trial++) {
-        printf("PY_WRAP_DEBUG: Trial %d/%d\n", Trial, MaxTrials);
-        
-        if (Trial > 1 && GetTime() - StartTime >= TimeLimit) {
-            printf("PY_WRAP_DEBUG: Time limit exceeded\n");
-            if (TraceLevel >= 1)
-                printff("*** Time limit exceeded ***\n");
-            break;
-        }
-        
-        /* Choose FirstNode at random */
-        if (Dimension == DimensionSaved) {
-            FirstNode = &NodeSet[1 + Random() % Dimension];
-            printf("PY_WRAP_DEBUG: FirstNode randomly chosen: %d\n", FirstNode->Id);
-        } else {
-            for (i2 = Random() % Dimension; i2 > 0; i2--)
-                FirstNode = FirstNode->Suc;
-            printf("PY_WRAP_DEBUG: FirstNode set to: %d\n", FirstNode->Id);
-        }
-        
-        printf("PY_WRAP_DEBUG: Choosing initial tour\n");
-        ChooseInitialTour();
-        
-        // Validate solver state before LinKernighan
-        if (!validate_solver_state(true)) {
-            printf("ERROR: Solver state validation failed before LinKernighan at trial %d\n", Trial);
-            continue; // Skip this trial if the state is invalid
-        }
-        
-        printf("PY_WRAP_DEBUG: Running LinKernighan\n");
-        Cost_2 = LinKernighan();
-        printf("PY_WRAP_DEBUG: LinKernighan completed with cost %lld\n", Cost_2);
-        
-        if (CurrentPenalty < BetterPenalty ||
-            (CurrentPenalty == BetterPenalty && Cost_2 < BetterCost)) {
-            if (TraceLevel >= 1) {
-                printff("* %d: ", Trial);
-                StatusReport(Cost_2, EntryTime_2, empty_str);
-            }
-            BetterCost = Cost_2;
-            BetterPenalty = CurrentPenalty;
-            
-            printf("PY_WRAP_DEBUG: Recording better tour\n");
-            RecordBetterTour();
-            
-            printf("PY_WRAP_DEBUG: Adjusting candidate set\n");
-            AdjustCandidateSet();
-            
-            printf("PY_WRAP_DEBUG: Preparing kicking\n");
-            PrepareKicking();
-            
-            if (HashingUsed) {
-                HashInitialize(HTable);
-                HashInsert(HTable, Hash, Cost_2);
-            }
-        } else if (TraceLevel >= 2) {
-            printff("  %d: ", Trial);
-            StatusReport(Cost_2, EntryTime_2, empty_str);
-        }
+    return true;
+}
+
+void LKHSolver::reset_node_tour_fields_internal() {
+    // Operates on NodeSet pointed to by global FirstNode
+    if (!FirstNode) return;
+    Node *t = FirstNode;
+    do {
+        t->OldPred = t->OldSuc = t->NextBestSuc = t->BestSuc = 0;
+    } while ((t = t->Suc) != FirstNode);
+}
+
+void LKHSolver::select_random_first_node_internal() {
+    // Modifies global FirstNode
+    if (Dimension <= 0) return;
+    extern unsigned Random(void); // LKH's Random
+    if (Dimension == DimensionSaved) {
+        FirstNode = &NodeSet[1 + Random() % Dimension];
+    } else {
+        for (int i = Random() % Dimension; i > 0; i--)
+            FirstNode = FirstNode->Suc;
     }
-    
-    printf("PY_WRAP_DEBUG: Trials complete, finalizing tour\n");
-    t = FirstNode;
+}
+
+void LKHSolver::finalize_tour_from_best_suc_internal() {
+    // Modifies global FirstNode's Suc/Pred chain and global Hash
+    if (!FirstNode) return;
+    Node *t = FirstNode;
     if (Norm == 0 || MaxTrials == 0 || !t->BestSuc) {
         do
             t = t->BestSuc = t->Suc;
         while (t != FirstNode);
     }
+    //t = FirstNode;
     do
         (t->Suc = t->BestSuc)->Pred = t;
     while ((t = t->BestSuc) != FirstNode);
     
     if (HashingUsed) {
-        Hash = 0;
-        do
-            Hash ^= Rand[t->Id] * Rand[t->Suc->Id];
-        while ((t = t->BestSuc) != FirstNode);
-    }
-    
-    if (Trial > MaxTrials)
-        Trial = MaxTrials;
-    CurrentPenalty = BetterPenalty;
-
-    // 7. Record the final tour
-    printf("PY_WRAP_DEBUG: Recording best tour\n");
-    RecordBestTour();
-
-    // 8. Get the best tour
-    if (Dimension <=0) { // Add a check before trying to new an array based on Dimension
-      printff("PY_WRAP_ERROR: Dimension is %d, cannot safely operate on BestTour or BetterTour.\n", Dimension);
-      return LLONG_MAX; // Indicate error
-    }
-    
-    printf("PY_WRAP_DEBUG: Best tour: ");
-    for (int i = 0; i <= DimensionSaved && i < 10; i++) { // Print just the first 10 nodes to avoid clutter
-        printf("%d ", BestTour[i]);
-    }
-    printf("... (truncated for brevity)\n");
-
-    // 9. Return the best tour cost
-    printf("PY_WRAP_DEBUG: Returning best cost: %lld\n", BetterCost);
-    return BetterCost;
-}
-
-// =====================================================================================
-// New Python-STEP-Solver helper functions (Granular Control)
-// =====================================================================================
-
-// Node State Management
-void py_reset_node_tour_fields() {
-    Node *t = FirstNode;
-    if (!t) {
-        printf("PY_WRAP_ERROR: FirstNode is NULL in py_reset_node_tour_fields\n");
-        return;
-    }
-    do {
-        t->OldPred = t->OldSuc = t->NextBestSuc = t->BestSuc = 0;
-    } while ((t = t->Suc) != FirstNode);
-    printf("PY_WRAP_DEBUG: Node tour fields reset (OldPred, OldSuc, NextBestSuc, BestSuc).\n");
-}
-
-// Cost and Penalty Getters/Setters
-long long get_better_cost() { return BetterCost; }
-void set_better_cost(long long cost) { 
-    BetterCost = cost;
-    printf("PY_WRAP_DEBUG: BetterCost set to %lld\n", BetterCost);
-}
-
-long long get_better_penalty() { return BetterPenalty; }
-void set_better_penalty(long long penalty) { 
-    BetterPenalty = penalty;
-    printf("PY_WRAP_DEBUG: BetterPenalty set to %lld\n", BetterPenalty);
-}
-
-long long get_current_penalty() { return CurrentPenalty; }
-void set_current_penalty(long long penalty) { 
-    CurrentPenalty = penalty; 
-    printf("PY_WRAP_DEBUG: CurrentPenalty set to %lld\n", CurrentPenalty);
-}
-
-// FirstNode Selection
-void py_select_random_first_node() {
-    if (Dimension <= 0) {
-        printf("PY_WRAP_ERROR: Dimension invalid in py_select_random_first_node\n");
-        return;
-    }
-    if (Dimension == DimensionSaved) {
-        FirstNode = &NodeSet[1 + Random() % Dimension];
-    } else {
-        // This case (Dimension != DimensionSaved) is complex and usually related to problem transformations.
-        // For typical TSP, Dimension == DimensionSaved after ReadProblem.
-        // If it occurs, ensure FirstNode is already part of a valid circular list.
-        if (!FirstNode) { 
-            printf("PY_WRAP_ERROR: FirstNode is NULL before random selection (Dim != DimSaved)\n"); 
-            return; 
-        }
-        for (int i = Random() % Dimension; i > 0; i--)
-            FirstNode = FirstNode->Suc;
-    }
-    if(FirstNode) printf("PY_WRAP_DEBUG: Random FirstNode selected: ID %d\n", FirstNode->Id);
-    else printf("PY_WRAP_ERROR: FirstNode became NULL after selection\n");
-
-}
-
-int get_first_node_id() {
-    if (FirstNode) return FirstNode->Id;
-    return -1; // Error or not set
-}
-
-// Trial Management
-void set_trial_number(int n) { 
-    Trial = n; 
-    // printf("PY_WRAP_DEBUG: Trial set to %d\n", Trial); // Can be verbose
-}
-int get_trial_number() { return Trial; }
-
-// Hashing Control
-bool is_hashing_used() { return (bool)HashingUsed; }
-unsigned get_lkh_hash() { return Hash; } // LKH global Hash
-
-// Tour Finalization
-void py_finalize_tour_from_best_suc() {
-    Node *t = FirstNode;
-    if (!t) {
-        printf("PY_WRAP_ERROR: FirstNode is NULL in py_finalize_tour_from_best_suc\n");
-        return;
-    }
-    printf("PY_WRAP_DEBUG: Finalizing tour from BestSuc chain...\n");
-
-    // This logic mirrors the end of LKH's FindTour and the C++ solve_and_record_trajectory
-    if (Norm == 0 || MaxTrials == 0 || !t->BestSuc) {
-        printf("PY_WRAP_DEBUG: Setting BestSuc = Suc for all nodes as fallback/initial state in finalize.\n");
-        Node* current = FirstNode;
-        do {
-            if (!current->BestSuc) current->BestSuc = current->Suc;
-            current = current->Suc;
-        } while (current != FirstNode);
-    }
-    
-    t = FirstNode;
-    do {
-        if (!t->BestSuc) { 
-            printf("PY_WRAP_WARNING: Node %d BestSuc is NULL during finalization. Using t->Suc.\n", t->Id);
-            t->BestSuc = t->Suc; 
-        }
-        (t->Suc = t->BestSuc)->Pred = t;
-    } while ((t = t->BestSuc) != FirstNode);
-    printf("PY_WRAP_DEBUG: Suc pointers updated from BestSuc chain.\n");
-
-    if (HashingUsed) {
-        Hash = 0; // Recalculate hash based on the final tour
+        Hash = 0; 
         t = FirstNode;
         do {
             Hash ^= Rand[t->Id] * Rand[t->Suc->Id];
         } while ((t = t->Suc) != FirstNode);
-        printf("PY_WRAP_DEBUG: Final Hash recalculated: %u\n", Hash);
+    }
+
+    if (Trial > MaxTrials)
+        Trial = MaxTrials;
+    CurrentPenalty = BetterPenalty;
+}
+
+long long LKHSolver::calculate_penalty_internal() {
+    return Penalty(); // Operates on LKH globals, returns penalty
+}
+
+void LKHSolver::hash_initialize_internal() {
+    if (HTable) { 
+        HashInitialize(HTable); // Operates on global HTable
     }
 }
 
-// Expose Penalty() function
-long long py_calculate_penalty() {
-    long long p = Penalty();
-    printf("PY_WRAP_DEBUG: Penalty() called, result: %lld\n", p);
-    return p;
-}
-
-// Wrapper for HashInitialize to be called from Python without args
-void py_wrapper_hash_initialize() {
-    if (HTable) { // Ensure HTable is not null, though it should be allocated by AllocateStructures if HashingUsed
+void LKHSolver::hash_insert_internal(unsigned hash_val, long long cost) {
+    if (HTable) { 
         HashInitialize(HTable);
-        printf("PY_WRAP_DEBUG: HashInitialize(HTable) called via wrapper.\n");
-    } else {
-        printf("PY_WRAP_ERROR: HTable is NULL in py_wrapper_hash_initialize. Hashing might not be properly set up.\n");
+        HashInsert(HTable, hash_val, cost); // Operates on global HTable
     }
 }
 
+long long LKHSolver::calculate_tour_cost_internal() {
+    // Calculates cost from current tour in LKH globals (FirstNode, Suc pointers, C func, Precision)
+    if (!FirstNode || Dimension <= 0) { 
+        throw std::runtime_error("Tour is not available or Dimension is invalid for calculate_tour_cost_internal");
+    }
+    long long cost = 0;
+    Node *t = FirstNode;
+    do {
+        cost += C(t, t->Suc); // C is LKH's global cost function
+        t = t->Suc;
+    } while (t != FirstNode);
+    return cost / Precision; // Precision is LKH's global
+}
+
+// ---- End Internal Helper Methods ----
+
+
+// Public methods below will retain their own lock, install_globals, and uninstall_globals
+// to ensure they are safe to call independently from Python.
+
+// Initialization methods (public, with lock)
+/* Original public methods are now above, calling the _internal ones.
+   The definitions from line 1175 to 1398 are redundant and cause redefinition errors.
+   Removing them. The existing public methods from lines 510-791 have been updated to correctly
+   use the lock, install/uninstall and call the _internal versions.
+*/
+
+
+// Python bindings
 PYBIND11_MODULE(lkh_solver, m) {
-    m.doc() = "Python bindings for the LKH-AMZ TSP solver";
+    m.doc() = "Python bindings for the LKH-AMZ TSP solver with class-based design for multiprocessing";
 
-    m.def("solve_and_record_trajectory", &solve_and_record_trajectory, "Run the LKH-AMZ TSP solver");
-    m.def("read_problem_file", &read_problem_file, "Read the TSP problem file");
-    m.def("read_parameter_file", &read_parameter_file, "Read the LKH parameters file");
-    m.def("AllocateStructures", &AllocateStructures, "Allocate memory for LKH structures");
-    
-    // Replace direct C function bindings with safe wrappers
-    m.def("CreateCandidateSet", &safe_create_candidate_set, "Safely create the candidate set");
-    m.def("ChooseInitialTour", &safe_choose_initial_tour, "Safely choose the initial tour");
-    m.def("LinKernighan", &safe_lin_kernighan, "Safely run the Lin-Kernighan algorithm");
-    m.def("RecordBetterTour", &safe_record_better_tour, "Safely record the better tour");
-    m.def("RecordBestTour", &safe_record_best_tour, "Safely record the best tour");
-    m.def("AdjustCandidateSet", &safe_adjust_candidate_set, "Safely adjust the candidate set");
-    m.def("PrepareKicking", &safe_prepare_kicking, "Safely prepare for kicking");
-    
-    m.def("InitializeStatistics", &InitializeStatistics, "Initialize statistics");
-    m.def("UpdateStatistics", &UpdateStatistics, "Update statistics");
-    m.def("StatusReport", &StatusReport, "Report the status");
-    m.def("Penalty", &Penalty, "Calculate the penalty"); // Direct Penalty, py_calculate_penalty is a verbose wrapper
-    
-    // Modified HashInitialize binding to use the wrapper
-    m.def("HashInitialize", &py_wrapper_hash_initialize, "Initialize the hash table (uses global HTable)"); 
-    m.def("HashInsert", &HashInsert, "Insert into the hash table");
-    
-    // Add the new functions
-    m.def("get_best_tour", &get_best_tour, "Get the best tour found by the solver");
-    m.def("get_dimension", &get_dimension, "Get the dimension of the problem");
-    m.def("get_best_cost", &get_best_cost, "Get the cost of the best tour");
-    
-    // Add debugging/validation functions
-    m.def("validate_solver_state", &validate_solver_state, py::arg("fix_issues") = true,
-          "Validate the solver's internal state and optionally fix issues");
+    py::class_<LKHSolver>(m, "LKHSolver")
+        .def(py::init<>())
+        
+        // File management
+        .def("set_parameter_file", &LKHSolver::set_parameter_file)
+        .def("set_problem_file", &LKHSolver::set_problem_file)
+        .def("set_tour_file", &LKHSolver::set_tour_file)
+        .def("set_pi_file", &LKHSolver::set_pi_file)
+        .def("set_initial_tour_file", &LKHSolver::set_initial_tour_file)
+        
+        // Initialization
+        .def("read_parameters", &LKHSolver::read_parameters)
+        .def("read_problem", &LKHSolver::read_problem)
+        .def("allocate_structures", &LKHSolver::allocate_structures)
+        .def("initialize_run_globals", &LKHSolver::initialize_run_globals)
+        
+        // Core solver functions
+        .def("create_candidate_set", &LKHSolver::create_candidate_set)
+        .def("initialize_statistics", &LKHSolver::initialize_statistics)
+        .def("choose_initial_tour", &LKHSolver::choose_initial_tour)
+        .def("lin_kernighan", &LKHSolver::lin_kernighan)
+        .def("record_better_tour", &LKHSolver::record_better_tour)
+        .def("record_best_tour", &LKHSolver::record_best_tour)
+        .def("adjust_candidate_set", &LKHSolver::adjust_candidate_set)
+        .def("prepare_kicking", &LKHSolver::prepare_kicking)
+        
+        // State management
+        .def("reset_node_tour_fields", &LKHSolver::reset_node_tour_fields)
+        .def("select_random_first_node", &LKHSolver::select_random_first_node)
+        .def("finalize_tour_from_best_suc", &LKHSolver::finalize_tour_from_best_suc)
+        .def("calculate_penalty", &LKHSolver::calculate_penalty)
+        
+        // Hash functions
+        .def("hash_initialize", &LKHSolver::hash_initialize)
+        .def("hash_insert", &LKHSolver::hash_insert)
+        
+        // Getters and setters
+        .def("get_best_cost", &LKHSolver::get_best_cost)
+        .def("get_better_cost", &LKHSolver::get_better_cost)
+        .def("get_better_penalty", &LKHSolver::get_better_penalty)
+        .def("get_current_penalty", &LKHSolver::get_current_penalty)
+        .def("get_dimension", &LKHSolver::get_dimension)
+        .def("get_first_node_id", &LKHSolver::get_first_node_id)
+        .def("get_trial_number", &LKHSolver::get_trial_number)
+        .def("is_hashing_used", &LKHSolver::is_hashing_used)
+        .def("get_lkh_hash", &LKHSolver::get_lkh_hash)
+        
+        .def("set_better_cost", &LKHSolver::set_better_cost)
+        .def("set_better_penalty", &LKHSolver::set_better_penalty)
+        .def("set_current_penalty", &LKHSolver::set_current_penalty)
+        .def("set_trial_number", &LKHSolver::set_trial_number)
+        
+        // Tour access
+        .def("get_best_tour", &LKHSolver::get_best_tour)
+        
+        // High-level interface
+        .def("solve_with_trajectory", &LKHSolver::solve_with_trajectory, 
+             py::arg("max_trials") = 10, py::arg("time_limit") = 3600.0)
+        
+        // Validation
+        .def("validate_solver_state", &LKHSolver::validate_solver_state, 
+             py::arg("fix_issues") = true)
+        
+        // Calculate actual tour cost from current tour structure
+        .def("calculate_tour_cost", &LKHSolver::calculate_tour_cost);
 
-    // Expose LKH's core file reading functions
-    m.def("LKH_ReadParameters", &ReadParameters, "Invoke LKH's internal ReadParameters function");
-    m.def("LKH_ReadProblem", &ReadProblem, "Invoke LKH's internal ReadProblem function");
-
-    // Expose initialization function
-    m.def("initialize_lkh_run_globals", &initialize_lkh_run_globals, "Initialize LKH global variables for a run");
-    m.def("SRandom", &SRandom, "Set the seed for LKH's random number generator");
-
-    // Granular control functions for Python-driven solver logic
-    m.def("py_reset_node_tour_fields", &py_reset_node_tour_fields, "Resets OldPred, OldSuc, NextBestSuc, BestSuc for all nodes");
-    m.def("get_better_cost", &get_better_cost, "Get current BetterCost");
-    m.def("set_better_cost", &set_better_cost, "Set current BetterCost");
-    m.def("get_better_penalty", &get_better_penalty, "Get current BetterPenalty");
-    m.def("set_better_penalty", &set_better_penalty, "Set current BetterPenalty");
-    m.def("get_current_penalty", &get_current_penalty, "Get current CurrentPenalty (often set by LK or Penalty())");
-    m.def("set_current_penalty", &set_current_penalty, "Set current CurrentPenalty");
-    m.def("py_select_random_first_node", &py_select_random_first_node, "Selects a random FirstNode for a trial");
-    m.def("get_first_node_id", &get_first_node_id, "Gets the ID of the current FirstNode");
-    m.def("set_trial_number", &set_trial_number, "Set LKH global Trial number");
-    m.def("get_trial_number", &get_trial_number, "Get LKH global Trial number");
-    m.def("is_hashing_used", &is_hashing_used, "Checks if HashingUsed is enabled in LKH");
-    m.def("get_lkh_hash", &get_lkh_hash, "Gets the current LKH global Hash value");
-    m.def("py_finalize_tour_from_best_suc", &py_finalize_tour_from_best_suc, "Finalizes tour by setting Suc from BestSuc and recalculates Hash");
-    m.def("py_calculate_penalty", &py_calculate_penalty, "Calls LKH Penalty() function and returns its result");
-
-    // Note: HashInitialize and HashInsert are already exposed.
-    // Safe wrappers for LKH algorithmic steps like RecordBetterTour, AdjustCandidateSet, PrepareKicking,
-    // ChooseInitialTour, LinKernighan, RecordBestTour remain essential.
+    // Simple factory function for creating solver instances (C++11 compatible)
+    m.def("create_solver", []() { 
+        return new LKHSolver(); 
+    }, py::return_value_policy::take_ownership);
 }
